@@ -44,7 +44,7 @@ ssh ds4-remote '/usr/local/cuda/extras/demo_suite/bandwidthTest --memory=pinned 
 # (once on the remote, takes sudo password): sudo apt install -y nsight-systems
 ssh ds4-remote 'cd ~/ds4 && DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512 \
   nsys profile -o /tmp/p --trace=cuda,nvtx,osrt --force-overwrite=true \
-  ./ds4-bench -m ds4flash.gguf --prompt-file bench/promessi_sposi.txt \
+  ./ds4-bench -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt \
     --ctx-start 4096 --ctx-max 4096 --gen-tokens 32 && \
   nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum /tmp/p.nsys-rep | head -60'
 ```
@@ -72,7 +72,7 @@ Five edits in [ds4_cuda.cu](../ds4_cuda.cu):
 ssh ds4-remote 'cd ~/ds4 && make clean && make CUDA_ARCH=sm_120 -j && \
   ./ds4_test --all && \
   ./ds4 --ctx 32768 -p "Explain quantum entanglement in one sentence." --nothink && \
-  ./ds4-bench -m ds4flash.gguf --prompt-file bench/promessi_sposi.txt \
+  ./ds4-bench -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt \
     --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128'
 ```
 
