@@ -322,10 +322,12 @@ Now the box is foundation-ready, install only the engines you intend to use. Eac
 cd ~
 git clone https://github.com/berschmitt/ds4.git
 cd ds4
-make CUDA_ARCH=sm_120 -j$(nproc)
+make cuda CUDA_ARCH=sm_120 -j$(nproc)
 ```
 
 (Adjust the clone URL if the fork moves.)
+
+Note: upstream made target selection explicit (commit `8aaf3d1`) — bare `make` now prints a help menu. Use `make cuda CUDA_ARCH=sm_120` for our Blackwell build, `make cuda-spark` for DGX Spark, or `make cuda-generic` for auto-detect.
 
 ### Pull the model
 
