@@ -5528,6 +5528,30 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
     return 1;
 }
 
+int ds4_gpu_rms_norm_matmul_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   eps) {
+    if (in_dim > UINT32_MAX) return 0;
+    if (!ds4_gpu_rms_norm_plain_tensor(norm_tmp, x, (uint32_t)in_dim, eps)) {
+        return 0;
+    }
+    return ds4_gpu_matmul_f16_tensor(out,
+                                     model_map,
+                                     model_size,
+                                     weight_offset,
+                                     in_dim,
+                                     out_dim,
+                                     norm_tmp,
+                                     1);
+}
+
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
