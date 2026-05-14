@@ -69,6 +69,12 @@ Validation status for `5347041`:
 - `make test CUDA_ARCH=sm_120` has the same known `logprob-vectors / long_memory_archive` 7-failure pattern seen before this patch; no new failure shape observed.
 - Nsight confirms `head_rms_norm_rope_tail_kernel` is active.
 
+## Rejected RTX Pro 6000 probes
+
+- `codex/cuda-end-sync-experiment`: made CUDA command-boundary synchronization optional. No meaningful throughput gain; profiler `cudaDeviceSynchronize` time was mostly waiting for GPU work.
+- `codex/hc-rms-mix-fusion`: fused HC RMS norm plus 24-wide HC mix projection into one CUDA block. Correctness smoke passed, but decode collapsed to roughly 10 t/s because the kernel lost row-level parallelism.
+- `codex/hc-rms-mix-row-fusion`: row-parallel HC RMS plus mix projection. Preserved performance and measured about +1.3% at `ctx=4096`, but the gain is too small for the extra kernel surface and redundant RMS work. Treat the HC RMS/mix route as closed unless a larger related redesign appears.
+
 ## Current diagnosis
 
 The initial WSL2 path was not representative. Bare-metal Ubuntu removed the catastrophic WSL2 behavior and brought generation to roughly 38-43 t/s depending on context.
