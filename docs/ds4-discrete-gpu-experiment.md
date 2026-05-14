@@ -1,79 +1,130 @@
-# DS4 cudaMalloc-for-discrete-GPU experiment
+# DS4 RTX Pro 6000 discrete-GPU experiment
 
-Short, focused plan written against [PRINCIPLES.md](../PRINCIPLES.md). A longer 600-line historical version lives outside the repo at `C:\Users\Bertrand\.claude\plans\so-i-just-forked-composed-perlis.md`.
+Short, current plan written against [PRINCIPLES.md](../PRINCIPLES.md). This is a home-lab science workflow: preserve correctness, measure before optimizing, and keep changes easy to compare with upstream.
 
-## What we observed on WSL2 (RTX Pro 6000, 64 GB host)
+## Current host
 
-- `--ctx 4096`: gen ~4 t/s, prefill ~3–10 t/s. (DGX Spark baseline: 343 t/s prefill / 13.75 t/s gen at 7 k tokens.)
-- Default `--ctx 32768` OOMs in model arena ([ds4_cuda.cu:773-789](../ds4_cuda.cu)) — 1792 MiB chunks fragment after ~74 GiB.
-- ~95 GiB usable VRAM (WSLg compositor takes ~400 MiB). 81 GiB model leaves ~14 GiB for KV+scratch.
-- Weight upload ~4.4 GB/s (suspected SSD-bound, not PCIe; `bandwidthTest` will tell).
+- Machine: `bst-originpc-ai`
+- OS: Ubuntu 24.04 LTS bare metal
+- GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, `sm_120`, 96 GB VRAM
+- CUDA driver/toolchain observed: driver 595.71.05, CUDA runtime 13.2, nvcc 13.0
+- Remote workflow: [remote-rtx-pro-6000-access-contract.md](remote-rtx-pro-6000-access-contract.md)
 
-## Hypothesis
+## Required runtime policy
 
-Universal `cudaMallocManaged` at [ds4_cuda.cu:1130](../ds4_cuda.cu) for KV / activation / scratch tensors may be the dominant cost on a discrete GPU. Managed memory routes through Windows HMM on WSL2 and can fault-migrate pages on every kernel touch.
+Recommended environment for this 96 GB discrete card:
 
-Could also be: per-kernel launch overhead, suboptimal wmma kernels on Blackwell, PCIe throttling. The diagnostic below discriminates.
-
-## Setup: SSH bridge from this PC into BST-ORIGINPC's WSL2
-
-Full setup recipe in [wsl2-bridge-setup.md](wsl2-bridge-setup.md). Short version: mirrored networking + Hyper-V firewall allow for port 2222 + WSL2 sshd (socket-activated, listening on 2222) + ed25519 key auth + `~/.ssh/config` alias `ds4-remote`. After setup, `ssh ds4-remote 'cmd'` runs `cmd` inside the remote's WSL2 shell over Tailscale, no password prompt.
-
-## Diagnose (this is the experiment)
-
-Three measurements:
-
-```sh
-# (1) GPU util pattern during inference
-ssh ds4-remote 'bash -c "
-cd ~/ds4
-nvidia-smi dmon -s mu -c 90 > /tmp/dmon.log 2>&1 &
-DMON_PID=\$!
-sleep 1
-DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512 ./ds4 --ctx 4096 \
-  -p \"Write 200 words about memory bandwidth.\" --nothink -n 128 2>&1
-wait \$DMON_PID 2>/dev/null
-echo ---DMON---
-cat /tmp/dmon.log
-"'
-
-# (2) PCIe sanity check
-ssh ds4-remote '/usr/local/cuda/extras/demo_suite/bandwidthTest --memory=pinned --htod --dtoh'
-
-# (3) Kernel timing — install nsys interactively once, then profile
-# (once on the remote, takes sudo password): sudo apt install -y nsight-systems
-ssh ds4-remote 'cd ~/ds4 && DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512 \
-  nsys profile -o /tmp/p --trace=cuda,nvtx,osrt --force-overwrite=true \
-  ./ds4-bench -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt \
-    --ctx-start 4096 --ctx-max 4096 --gen-tokens 32 && \
-  nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum /tmp/p.nsys-rep | head -60'
+```bash
+export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128
+export DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1
 ```
 
-**Decision tree** (one of these, based on the data):
-- *dmon shows oscillating util + mem-bw spikes, or nsys shows mid-inference H2D copies* → managed-memory hypothesis supported. Do the code change.
-- *dmon shows steady low util between kernels* → per-kernel launch overhead is the bottleneck. Code change probably doesn't help much; wait for bare metal.
-- *dmon shows high+steady util at peak memory bandwidth* → kernels are working as well as they can on this hardware; remaining gap is kernel quality (wmma path on Blackwell). Out of scope for this fork.
+Why:
 
-## If supported: code change
+- The default q8->f16 cache reserve is conservative for unified-memory DGX Spark style systems and leaves useful RTX Pro 6000 VRAM unused.
+- Lowering the reserve from the default to 128 MB improves prefill by allowing more q8 f16 cache entries.
+- Skipping `attn_output_*` q8 f16 caching lets the limited spare VRAM cache smaller, more reused q8 tensors instead.
 
-Five edits in [ds4_cuda.cu](../ds4_cuda.cu):
+Canonical reference CSVs live in `speed-bench/`:
 
-1. **Line 27** — add `void *host_shadow;` to `ds4_gpu_tensor` struct.
-2. **Line 774** — change arena chunk default `1792` → `512` (kills the `--ctx 32768` OOM).
-3. **Line 1126** — `cudaMallocManaged` → `cudaMalloc` in `ds4_gpu_tensor_alloc`.
-4. **Line 1149** — free `host_shadow` in `ds4_gpu_tensor_free`.
-5. **Line 1159** — stage DtoH copy in `ds4_gpu_tensor_contents` (single caller: [ds4.c:8348](../ds4.c)).
+- `rtx_pro_6000_default_reserve.csv`
+- `rtx_pro_6000_reserve_512mb.csv`
+- `rtx_pro_6000_reserve_128mb.csv`
+- `rtx_pro_6000.csv` - current recommended policy baseline
 
-(`ds4_gpu_tensor` is private to `ds4_cuda.cu` — see [ds4_gpu.h:16](../ds4_gpu.h) forward declaration. Metal and CPU paths are unaffected.)
+## Current baseline
 
-## Validate
+Command:
 
-```sh
-ssh ds4-remote 'cd ~/ds4 && make clean && make CUDA_ARCH=sm_120 -j && \
-  ./ds4_test --all && \
-  ./ds4 --ctx 32768 -p "Explain quantum entanglement in one sentence." --nothink && \
-  ./ds4-bench -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt \
-    --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128'
+```bash
+DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 \
+DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1 \
+./ds4-bench -m ds4flash.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128
 ```
 
-Pass: `ds4_test --all` doesn't regress vs. running it pre-change; gen t/s improves vs. the ~4 t/s observation. If anything looks wrong, `git checkout -- ds4_cuda.cu` and revisit.
+Current canonical baseline, before the small decode Q norm+RoPE fusion:
+
+- `ctx=2048`: 541.33 prefill t/s, 43.25 gen t/s
+- `ctx=4096`: 528.38 prefill t/s, 42.47 gen t/s
+- `ctx=32768`: 494.83 prefill t/s, 37.90 gen t/s
+
+Latest post-fusion sweep was kept as a run artifact instead of overwriting the canonical CSV because prefill was noisier/lower despite the patch being decode-only:
+
+- Run: `~/ds4/codex-runs/20260514-201147-decode-fusion-full-sweep`
+- `ctx=4096`: 522.28 prefill t/s, 42.71 gen t/s
+- `ctx=32768`: 490.80 prefill t/s, 38.10 gen t/s
+
+## Merged RTX Pro 6000 changes
+
+- `a865750` / related speed-bench commits: recommended q8 f16 cache policy and CSV baselines.
+- `1d35fbb`: pair decode q and kv q8 matvecs. Small but repeatable decode gain.
+- `5347041`: fuse decode Q head RMS norm and RoPE via existing CUDA helper. Small repeatable decode gain, with `DS4_METAL_DISABLE_Q_HEAD_ROPE_FUSION=1` as the reference fallback.
+
+Validation status for `5347041`:
+
+- CUDA build passed on `sm_120`.
+- Smoke generation passed.
+- `make test CUDA_ARCH=sm_120` has the same known `logprob-vectors / long_memory_archive` 7-failure pattern seen before this patch; no new failure shape observed.
+- Nsight confirms `head_rms_norm_rope_tail_kernel` is active.
+
+## Current diagnosis
+
+The initial WSL2 path was not representative. Bare-metal Ubuntu removed the catastrophic WSL2 behavior and brought generation to roughly 38-43 t/s depending on context.
+
+Remaining decode performance is not dominated by one obvious allocation fallback. The q8 f16 cache still fills only a few GiB because the 80.76 GiB model plus context/scratch leaves limited spare VRAM, but the measured fallback shape is stable and partially mitigated by the 128 MB reserve plus no-attention-output policy.
+
+Nsight on a decode-focused fixed-token bench:
+
+```bash
+DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 \
+DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1 \
+nsys profile -o /tmp/ds4-bench-decode64 --trace=cuda,nvtx,osrt --force-overwrite=true \
+  ./ds4-bench -m ds4flash.gguf \
+    --prompt-file speed-bench/promessi_sposi.txt \
+    --ctx-start 64 --ctx-max 64 --step-incr 2048 --gen-tokens 512
+```
+
+Observed run:
+
+- Run: `~/ds4/codex-runs/20260514-201904-decode64-bench-nsys`
+- `ctx=64`: 51.61 gen t/s
+- CUDA launches: about 799k for the profiled process
+- Largest GPU kernel buckets: MoE decode, f16 ordered matmuls, attention decode, q8 matvecs, HC expansion, RMS norms
+
+This points to general decode kernel fragmentation plus real q8/MoE/matvec kernel time. More one-launch micro-fusions will help only marginally unless they sit on a high-count, high-time path.
+
+## Next engineering targets
+
+1. **CUDA Graph replay feasibility**
+   - Potentially the largest host-launch reduction.
+   - Hard because token position, cache counters, compression/indexer topology, and occasional ratio-dependent branches change across tokens.
+   - Needs a prototype with graph node parameter updates or device-side parameter buffers, not a broad rewrite.
+
+2. **MoE/shared decode kernels**
+   - The decode-focused profile shows MoE and shared/expert matvec kernels as major GPU-time buckets.
+   - Safer next step is to inspect existing fused MoE/shared helpers before adding new kernels.
+
+3. **Attention/indexer at longer context**
+   - `ctx=64` highlights pure decode overhead; `ctx=4096+` adds indexed attention/indexer cost.
+   - Any long-context change must be checked at both `ctx=4096` and `ctx=32768`.
+
+4. **Avoid risky KV RoPE fusion for now**
+   - FP8 KV quantization plus raw-cache store is already fused.
+   - KV RoPE is intentionally standalone for exactness; fusing it with FP8/store is possible but higher risk than the current evidence justifies.
+
+## Correctness gate
+
+Token-byte parity vs the official DeepSeek V4 Flash API remains the hard gate. Existing known CUDA failures must be tracked separately from new regressions:
+
+```bash
+make test CUDA_ARCH=sm_120
+```
+
+For now, a candidate patch is acceptable only if:
+
+- It builds for `CUDA_ARCH=sm_120`.
+- Smoke generation works.
+- `make test CUDA_ARCH=sm_120` does not introduce a new failure shape beyond the known `long_memory_archive` logprob-vector failures.
+- A/B decode benchmarks show a repeatable gain, not a single lucky run.
