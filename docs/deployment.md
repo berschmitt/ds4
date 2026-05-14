@@ -354,15 +354,18 @@ Puts the q2-imatrix GGUF (~81 GB) under `./gguf/` and symlinks `./ds4flash.gguf`
 export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512
 ```
 
-Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. Measured impact on this box:
+Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. Measured impact on this box (full ctx sweep 2k → 32k):
 
 | ctx | Default reserve | Reserve = 512 MB | Delta |
 |---|---:|---:|---:|
-| 2k | 370 t/s prefill | 510 t/s | **+38%** |
-| 8k | 359 t/s prefill | 494 t/s | **+38%** |
-| 16k | 351 t/s prefill | 484 t/s | **+38%** |
+| 2k | 370 t/s | 496 t/s | **+34%** |
+| 8k | 359 t/s | 479 t/s | **+33%** |
+| 16k | 351 t/s | 469 t/s | **+33%** |
+| 32k | 342 t/s | 454 t/s | **+33%** |
 
-Generation rate **unchanged** by this knob — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's likely per-kernel launch overhead and/or stream serialization on small per-token kernels; both upstream concerns). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
+Consistent ~33% prefill improvement across all ctx values. Generation rate **unchanged** by this knob (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable in this fork). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
+
+**Why the default is conservative**: the formula is `max(4 GiB, total_VRAM/20)`. That makes sense on unified-memory devices (DGX Spark, M-series Macs) where "VRAM" is shared with the OS/page-cache — eating it all would starve the host. On a *discrete* GPU, VRAM is physically isolated; nothing else uses it; the reserve is over-protective. Hence the explicit override.
 
 ## Driving the box from Claude Code / VS Code
 
