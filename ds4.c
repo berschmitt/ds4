@@ -8962,6 +8962,11 @@ static bool metal_graph_use_reference_hc_norm_decode(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &cache);
 }
 
+static bool metal_graph_use_reference_hc_mix_norm(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_METAL_DISABLE_HC_MIX_NORM_FUSION", &cache);
+}
+
 static bool metal_graph_use_reference_shared_down_hc(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
@@ -9054,6 +9059,14 @@ static bool metal_graph_matmul_plain_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+static bool metal_graph_hc_mix_from_plain_norm(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_tmp,
+        const ds4_model        *model,
+        const ds4_tensor       *w,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
 
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
@@ -9099,9 +9112,13 @@ static bool metal_graph_encode_decode_layer(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    if (ok) ok = metal_graph_hc_mix_from_plain_norm(g->hc_mix,
+                                                    g->flat_hc,
+                                                    model,
+                                                    layer->hc_attn_fn,
+                                                    hc_dim,
+                                                    mix_hc,
+                                                    g->cur_hc);
     const bool fuse_hc_norm =
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
@@ -9647,9 +9664,13 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    if (ok) ok = metal_graph_hc_mix_from_plain_norm(g->hc_mix,
+                                                    g->flat_hc,
+                                                    model,
+                                                    layer->hc_ffn_fn,
+                                                    hc_dim,
+                                                    mix_hc,
+                                                    g->after_attn_hc);
     if (ok && fuse_hc_norm) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
                                                          g->ffn_norm,
@@ -10013,6 +10034,34 @@ static bool metal_graph_matmul_plain_tensor(
     }
     fprintf(stderr, "ds4: Metal plain matmul does not support %s\n", tensor_type_name(w->type));
     return false;
+}
+
+static bool metal_graph_hc_mix_from_plain_norm(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_tmp,
+        const ds4_model        *model,
+        const ds4_tensor       *w,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x) {
+    if (in_dim > UINT32_MAX) return false;
+    if (!metal_graph_use_reference_hc_mix_norm() &&
+        w->type == DS4_TENSOR_F16 &&
+        out_dim <= 32u) {
+        return ds4_gpu_rms_norm_matmul_f16_tensor(out,
+                                                   norm_tmp,
+                                                   model->map,
+                                                   model->size,
+                                                   w->abs_offset,
+                                                   in_dim,
+                                                   out_dim,
+                                                   x,
+                                                   DS4_RMS_EPS) != 0;
+    }
+    if (ds4_gpu_rms_norm_plain_tensor(norm_tmp, x, (uint32_t)in_dim, DS4_RMS_EPS) == 0) {
+        return false;
+    }
+    return metal_graph_matmul_plain_tensor(out, model, w, in_dim, out_dim, norm_tmp, 1);
 }
 
 static bool metal_graph_encode_output_head_mtp(
