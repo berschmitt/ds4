@@ -15,7 +15,10 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifndef M_PI
@@ -123,11 +126,27 @@ struct cuda_q8_f32_range {
     float *device_ptr;
 };
 
+struct cuda_q8_f16_cache_stats {
+    uint64_t first_offset;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t request_bytes;
+    uint64_t hits;
+    uint64_t stores;
+    uint64_t budget_misses;
+    uint64_t limit_misses;
+    uint64_t query_failures;
+    uint64_t alloc_failures;
+    uint64_t dequant_failures;
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
+static std::unordered_map<uint64_t, std::string> g_model_tensor_label_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
+static std::unordered_map<std::string, cuda_q8_f16_cache_stats> g_q8_f16_stats;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
@@ -328,7 +347,146 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     return 0;
 }
 
+static int cuda_q8_f16_cache_stats_enabled(void) {
+    return getenv("DS4_CUDA_Q8_F16_CACHE_STATS") != NULL;
+}
+
+static const char *cuda_model_tensor_label(uint64_t offset, const char *fallback) {
+    auto it = g_model_tensor_label_by_offset.find(offset);
+    if (it != g_model_tensor_label_by_offset.end()) return it->second.c_str();
+    return fallback;
+}
+
+static uint64_t cuda_parse_u64_env(const char *name, uint64_t fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return fallback;
+    return (uint64_t)v;
+}
+
+static std::string cuda_q8_f16_cache_stats_key(
+        const char *label,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    char dims[96];
+    snprintf(dims, sizeof(dims), "|in=%llu|out=%llu",
+             (unsigned long long)in_dim,
+             (unsigned long long)out_dim);
+    return std::string(label && label[0] ? label : "q8_0") + dims;
+}
+
+static cuda_q8_f16_cache_stats *cuda_q8_f16_cache_stats_for(
+        const char *label,
+        uint64_t offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t request_bytes) {
+    if (!cuda_q8_f16_cache_stats_enabled()) return NULL;
+    const std::string key = cuda_q8_f16_cache_stats_key(label, in_dim, out_dim);
+    std::pair<std::unordered_map<std::string, cuda_q8_f16_cache_stats>::iterator, bool> item =
+        g_q8_f16_stats.emplace(key, cuda_q8_f16_cache_stats{});
+    cuda_q8_f16_cache_stats &s = item.first->second;
+    if (item.second) {
+        s.first_offset = offset;
+        s.in_dim = in_dim;
+        s.out_dim = out_dim;
+        s.request_bytes = request_bytes;
+    } else if (request_bytes > s.request_bytes) {
+        s.request_bytes = request_bytes;
+    }
+    return &s;
+}
+
+static void cuda_q8_f16_cache_stats_print_and_clear(void) {
+    if (g_q8_f16_stats.empty()) return;
+
+    uint64_t total_hits = 0;
+    uint64_t total_stores = 0;
+    uint64_t total_budget_misses = 0;
+    uint64_t total_limit_misses = 0;
+    uint64_t total_query_failures = 0;
+    uint64_t total_alloc_failures = 0;
+    uint64_t total_dequant_failures = 0;
+    for (const auto &kv : g_q8_f16_stats) {
+        const cuda_q8_f16_cache_stats &s = kv.second;
+        total_hits += s.hits;
+        total_stores += s.stores;
+        total_budget_misses += s.budget_misses;
+        total_limit_misses += s.limit_misses;
+        total_query_failures += s.query_failures;
+        total_alloc_failures += s.alloc_failures;
+        total_dequant_failures += s.dequant_failures;
+    }
+
+    fprintf(stderr,
+            "ds4: CUDA q8 fp16 cache stats: entries=%zu cached=%.2f GiB "
+            "hits=%llu stores=%llu budget_misses=%llu limit_misses=%llu "
+            "query_failures=%llu alloc_failures=%llu dequant_failures=%llu\n",
+            g_q8_f16_stats.size(),
+            (double)g_q8_f16_bytes / 1073741824.0,
+            (unsigned long long)total_hits,
+            (unsigned long long)total_stores,
+            (unsigned long long)total_budget_misses,
+            (unsigned long long)total_limit_misses,
+            (unsigned long long)total_query_failures,
+            (unsigned long long)total_alloc_failures,
+            (unsigned long long)total_dequant_failures);
+
+    std::vector<std::string> keys;
+    keys.reserve(g_q8_f16_stats.size());
+    for (const auto &kv : g_q8_f16_stats) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end(), [](const std::string &a, const std::string &b) {
+        const cuda_q8_f16_cache_stats &sa = g_q8_f16_stats.find(a)->second;
+        const cuda_q8_f16_cache_stats &sb = g_q8_f16_stats.find(b)->second;
+        const uint64_t ma = sa.budget_misses + sa.limit_misses +
+                            sa.query_failures + sa.alloc_failures +
+                            sa.dequant_failures;
+        const uint64_t mb = sb.budget_misses + sb.limit_misses +
+                            sb.query_failures + sb.alloc_failures +
+                            sb.dequant_failures;
+        if (ma != mb) return ma > mb;
+        const uint64_t aa = sa.hits + sa.stores;
+        const uint64_t ab = sb.hits + sb.stores;
+        if (aa != ab) return aa > ab;
+        return a < b;
+    });
+
+    const uint64_t top = cuda_parse_u64_env("DS4_CUDA_Q8_F16_CACHE_STATS_TOP", 40);
+    uint64_t printed = 0;
+    for (const std::string &key : keys) {
+        if (printed >= top) break;
+        const cuda_q8_f16_cache_stats &s = g_q8_f16_stats.find(key)->second;
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache stat key=\"%s\" request=%.2f MiB "
+                "hits=%llu stores=%llu budget_misses=%llu limit_misses=%llu "
+                "query_failures=%llu alloc_failures=%llu dequant_failures=%llu "
+                "first_offset=%llu\n",
+                key.c_str(),
+                (double)s.request_bytes / 1048576.0,
+                (unsigned long long)s.hits,
+                (unsigned long long)s.stores,
+                (unsigned long long)s.budget_misses,
+                (unsigned long long)s.limit_misses,
+                (unsigned long long)s.query_failures,
+                (unsigned long long)s.alloc_failures,
+                (unsigned long long)s.dequant_failures,
+                (unsigned long long)s.first_offset);
+        printed++;
+    }
+
+    if (keys.size() > top) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache stats omitted %zu entries "
+                "(set DS4_CUDA_Q8_F16_CACHE_STATS_TOP to show more)\n",
+                keys.size() - (size_t)top);
+    }
+    g_q8_f16_stats.clear();
+}
+
 static void cuda_q8_f16_cache_release_all(void) {
+    cuda_q8_f16_cache_stats_print_and_clear();
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -414,11 +572,18 @@ static void cuda_q8_f16_cache_budget_notice(
     }
 }
 
-static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
-    (void)label;
+static int cuda_q8_f16_cache_has_budget(
+        uint64_t request_bytes,
+        const char *label,
+        uint64_t offset,
+        uint64_t in_dim,
+        uint64_t out_dim) {
     const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
     if (limit == 0) return 0;
     if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
+        cuda_q8_f16_cache_stats *s =
+            cuda_q8_f16_cache_stats_for(label, offset, in_dim, out_dim, request_bytes);
+        if (s) s->limit_misses++;
         cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
         return 0;
     }
@@ -429,6 +594,9 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache memory query failed: %s; using q8 kernels\n",
                 cudaGetErrorString(err));
+        cuda_q8_f16_cache_stats *s =
+            cuda_q8_f16_cache_stats_for(label, offset, in_dim, out_dim, request_bytes);
+        if (s) s->query_failures++;
         (void)cudaGetLastError();
         return 0;
     }
@@ -438,6 +606,9 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
     const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
     if (request_bytes > free_bytes ||
         free_bytes - request_bytes < reserve_bytes) {
+        cuda_q8_f16_cache_stats *s =
+            cuda_q8_f16_cache_stats_for(label, offset, in_dim, out_dim, request_bytes);
+        if (s) s->budget_misses++;
         cuda_q8_f16_cache_budget_notice("budget exhausted", request_bytes,
                                         free_bytes, total_bytes,
                                         reserve_bytes, limit);
@@ -530,28 +701,40 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
+    const char *cache_label = cuda_model_tensor_label(offset, label);
     auto exact = g_q8_f16_by_offset.find(offset);
     if (exact != g_q8_f16_by_offset.end()) {
         const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
         if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
             r.in_dim == in_dim && r.out_dim == out_dim) {
+            uint64_t cached_bytes = 0;
+            if (in_dim != 0 && out_dim <= UINT64_MAX / in_dim / sizeof(__half)) {
+                cached_bytes = in_dim * out_dim * sizeof(__half);
+            }
+            cuda_q8_f16_cache_stats *s =
+                cuda_q8_f16_cache_stats_for(cache_label, offset, in_dim, out_dim, cached_bytes);
+            if (s) s->hits++;
             return r.device_ptr;
         }
     }
-    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (!cuda_q8_f16_cache_allowed(cache_label, in_dim, out_dim)) return NULL;
 
-    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes,
+                                          cache_label ? cache_label : "q8_0");
     if (!q8) return NULL;
 
     if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
     const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
-    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
+    if (!cuda_q8_f16_cache_has_budget(out_bytes, cache_label, offset, in_dim, out_dim)) return NULL;
 
     __half *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, cudaGetErrorString(err));
+        cuda_q8_f16_cache_stats *s =
+            cuda_q8_f16_cache_stats_for(cache_label, offset, in_dim, out_dim, out_bytes);
+        if (s) s->alloc_failures++;
         cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
         return NULL;
     }
@@ -564,12 +747,18 @@ static const __half *cuda_q8_f16_ptr(
                                                           blocks);
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
         (void)cudaFree(dev);
+        cuda_q8_f16_cache_stats *s =
+            cuda_q8_f16_cache_stats_for(cache_label, offset, in_dim, out_dim, out_bytes);
+        if (s) s->dequant_failures++;
         cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         return NULL;
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
     g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
     g_q8_f16_bytes += out_bytes;
+    cuda_q8_f16_cache_stats *s =
+        cuda_q8_f16_cache_stats_for(cache_label, offset, in_dim, out_dim, out_bytes);
+    if (s) s->stores++;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
@@ -1231,6 +1420,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
+    g_model_tensor_label_by_offset.clear();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -1370,6 +1560,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
+    g_model_tensor_label_by_offset.clear();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
@@ -1485,6 +1676,12 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 #endif
     }
     return 1;
+}
+
+extern "C" void ds4_gpu_register_tensor_label(const void *model_map, uint64_t offset, const char *label) {
+    (void)model_map;
+    if (!label || !label[0]) return;
+    g_model_tensor_label_by_offset[offset] = label;
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {

@@ -1433,6 +1433,13 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     const double t0 = now_sec();
     uint64_t cached = 0;
     if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        char label[128];
+        snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+        ds4_gpu_register_tensor_label(m->map, t->abs_offset, label);
+    }
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {

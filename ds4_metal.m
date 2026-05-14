@@ -1141,6 +1141,12 @@ void ds4_gpu_print_memory_report(const char *label) {
             ds4_gpu_mib((uint64_t)g_raw_store_round_bytes));
 }
 
+void ds4_gpu_register_tensor_label(const void *model_map, uint64_t offset, const char *label) {
+    (void)model_map;
+    (void)offset;
+    (void)label;
+}
+
 void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
 }
