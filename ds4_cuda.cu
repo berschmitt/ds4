@@ -10151,7 +10151,7 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    if (getenv("DS4_CUDA_MOE_DECODE_LUT_H16") != NULL) {
+                    if (getenv("DS4_CUDA_MOE_NO_DECODE_LUT_H16") == NULL) {
                         dim3 hgrid((expert_mid_dim + 63u) / 64u, n_tokens * n_expert, 1);
                         moe_gate_up_mid_decode_lut_hwarp16_kernel<<<hgrid, 256>>>(
                             (float *)gate->ptr,
