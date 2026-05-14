@@ -354,16 +354,22 @@ Puts the q2-imatrix GGUF (~81 GB) under `./gguf/` and symlinks `./ds4flash.gguf`
 export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128
 ```
 
-Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. The first full ctx sweep used a 512 MB reserve and showed the main win:
+Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. The canonical full ctx sweep now uses this 128 MB reserve:
 
-| ctx | Default reserve | Reserve = 512 MB | Delta |
+| ctx | Default reserve | Reserve = 128 MB | Delta |
 |---|---:|---:|---:|
-| 2k | 370 t/s | 496 t/s | **+34%** |
-| 8k | 359 t/s | 479 t/s | **+33%** |
-| 16k | 351 t/s | 469 t/s | **+33%** |
-| 32k | 342 t/s | 454 t/s | **+33%** |
+| 2k | 370 t/s | 517 t/s | **+40%** |
+| 8k | 359 t/s | 498 t/s | **+39%** |
+| 16k | 351 t/s | 488 t/s | **+39%** |
+| 32k | 342 t/s | 473 t/s | **+38%** |
 
-Follow-up reserve sweeps at ctx 8k and ctx 32k showed diminishing returns below 128 MB: 128 MB improves prefill slightly vs 512 MB, while `0` MB adds almost nothing and leaves no safety margin. Generation rate is **unchanged** by this knob (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable by cache reserve tuning alone). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
+Reserve sweeps at ctx 8k and ctx 32k showed diminishing returns below 128 MB: `0` MB adds almost nothing and leaves no safety margin. Generation rate is **unchanged** by this knob (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable by cache reserve tuning alone). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
+
+Bench CSVs:
+
+- `speed-bench/rtx_pro_6000.csv` — canonical recommended config (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`)
+- `speed-bench/rtx_pro_6000_default_reserve.csv` — upstream default reserve, kept for before/after reference
+- `speed-bench/rtx_pro_6000_reserve_512mb.csv` — first tuned run, kept to show the diminishing return from 512 MB to 128 MB
 
 **Why the default is conservative**: the formula is `max(4 GiB, total_VRAM/20)`. That makes sense on unified-memory devices (DGX Spark, M-series Macs) where "VRAM" is shared with the OS/page-cache — eating it all would starve the host. On a *discrete* GPU, VRAM is physically isolated; nothing else uses it; the reserve is over-protective. Hence the explicit override.
 
