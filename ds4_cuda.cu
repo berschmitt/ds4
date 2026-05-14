@@ -1360,9 +1360,24 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+static int cuda_sync_command_boundaries(void) {
+    static int cache = -1;
+    if (cache == -1) {
+        const char *env = getenv("DS4_CUDA_SYNC_COMMAND_BOUNDARIES");
+        cache = env && env[0] && strcmp(env, "0") != 0;
+    }
+    return cache != 0;
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
+extern "C" int ds4_gpu_flush_commands(void) {
+    if (cuda_sync_command_boundaries()) return cuda_ok(cudaDeviceSynchronize(), "flush");
+    return cuda_ok(cudaGetLastError(), "flush");
+}
+extern "C" int ds4_gpu_end_commands(void) {
+    if (cuda_sync_command_boundaries()) return cuda_ok(cudaDeviceSynchronize(), "end commands");
+    return cuda_ok(cudaGetLastError(), "end commands");
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
