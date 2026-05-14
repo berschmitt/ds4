@@ -348,26 +348,28 @@ Puts the q2-imatrix GGUF (~81 GB) under `./gguf/` and symlinks `./ds4flash.gguf`
 
 ### Performance tuning
 
-**Lower the q8 fp16 cache reserve for a free prefill speedup.** Default is `max(4 GiB, 5% of VRAM)` = ~4.75 GiB on this 96 GB card, which is too conservative — leaves the fp16 dequant cache empty even when there's spare VRAM, so q8 weights re-dequantize per access during prefill. Set the reserve to 128 MB on this RTX Pro 6000; it keeps a small safety margin while recovering nearly all of the measured prefill gain:
+**Tune the q8 fp16 cache for a free prefill speedup.** Default reserve is `max(4 GiB, 5% of VRAM)` = ~4.75 GiB on this 96 GB card, which is too conservative — leaves the fp16 dequant cache empty even when there's spare VRAM, so q8 weights re-dequantize per access during prefill. Set the reserve to 128 MB and keep large attention-output projections out of the q8 fp16 cache:
 
 ```sh
 export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128
+export DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1
 ```
 
-Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. The canonical full ctx sweep now uses this 128 MB reserve:
+Add both to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. The canonical full ctx sweep now uses this pair of overrides:
 
-| ctx | Default reserve | Reserve = 128 MB | Delta |
-|---|---:|---:|---:|
-| 2k | 370 t/s | 517 t/s | **+40%** |
-| 8k | 359 t/s | 498 t/s | **+39%** |
-| 16k | 351 t/s | 488 t/s | **+39%** |
-| 32k | 342 t/s | 473 t/s | **+38%** |
+| ctx | Default reserve | Reserve = 128 MB | + no attn-output cache | Delta vs default |
+|---|---:|---:|---:|---:|
+| 2k | 370 t/s | 517 t/s | 541 t/s | **+46%** |
+| 8k | 359 t/s | 498 t/s | 522 t/s | **+45%** |
+| 16k | 351 t/s | 488 t/s | 512 t/s | **+46%** |
+| 32k | 342 t/s | 473 t/s | 495 t/s | **+45%** |
 
-Reserve sweeps at ctx 8k and ctx 32k showed diminishing returns below 128 MB: `0` MB adds almost nothing and leaves no safety margin. Generation rate is **unchanged** by this knob (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable by cache reserve tuning alone). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
+Reserve sweeps at ctx 8k and ctx 32k showed diminishing returns below 128 MB: `0` MB adds almost nothing and leaves no safety margin. Temporary cache-miss instrumentation then showed the first eligible tensors were monopolizing the cache: only 137 tensors were cached and misses began around layer 17. Excluding `attn_output_a/b` from the fp16 cache raises cached tensors to 216, drops budget misses from 828 to 168 in the ctx 8k/256-token diagnostic, and adds another ~4.6-4.8% prefill speed. Generation rate is **unchanged** by these knobs (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable by cache reserve tuning alone). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
 
 Bench CSVs:
 
-- `speed-bench/rtx_pro_6000.csv` — canonical recommended config (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`)
+- `speed-bench/rtx_pro_6000.csv` — canonical recommended config (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`)
+- `speed-bench/rtx_pro_6000_reserve_128mb.csv` — reserve-only run, kept to show the extra gain from excluding attention-output tensors
 - `speed-bench/rtx_pro_6000_default_reserve.csv` — upstream default reserve, kept for before/after reference
 - `speed-bench/rtx_pro_6000_reserve_512mb.csv` — first tuned run, kept to show the diminishing return from 512 MB to 128 MB
 
