@@ -348,13 +348,13 @@ Puts the q2-imatrix GGUF (~81 GB) under `./gguf/` and symlinks `./ds4flash.gguf`
 
 ### Performance tuning
 
-**Lower the q8 fp16 cache reserve for a free ~38% prefill speedup.** Default is `max(4 GiB, 5% of VRAM)` = ~4.75 GiB on this 96 GB card, which is too conservative — leaves the fp16 dequant cache empty even when there's spare VRAM, so q8 weights re-dequantize per access during prefill. Set the reserve to 512 MB instead so the cache populates:
+**Lower the q8 fp16 cache reserve for a free prefill speedup.** Default is `max(4 GiB, 5% of VRAM)` = ~4.75 GiB on this 96 GB card, which is too conservative — leaves the fp16 dequant cache empty even when there's spare VRAM, so q8 weights re-dequantize per access during prefill. Set the reserve to 128 MB on this RTX Pro 6000; it keeps a small safety margin while recovering nearly all of the measured prefill gain:
 
 ```sh
-export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512
+export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128
 ```
 
-Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. Measured impact on this box (full ctx sweep 2k → 32k):
+Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. The first full ctx sweep used a 512 MB reserve and showed the main win:
 
 | ctx | Default reserve | Reserve = 512 MB | Delta |
 |---|---:|---:|---:|
@@ -363,7 +363,7 @@ Add to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for 
 | 16k | 351 t/s | 469 t/s | **+33%** |
 | 32k | 342 t/s | 454 t/s | **+33%** |
 
-Consistent ~33% prefill improvement across all ctx values. Generation rate **unchanged** by this knob (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable in this fork). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
+Follow-up reserve sweeps at ctx 8k and ctx 32k showed diminishing returns below 128 MB: 128 MB improves prefill slightly vs 512 MB, while `0` MB adds almost nothing and leaves no safety margin. Generation rate is **unchanged** by this knob (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable by cache reserve tuning alone). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
 
 **Why the default is conservative**: the formula is `max(4 GiB, total_VRAM/20)`. That makes sense on unified-memory devices (DGX Spark, M-series Macs) where "VRAM" is shared with the OS/page-cache — eating it all would starve the host. On a *discrete* GPU, VRAM is physically isolated; nothing else uses it; the reserve is over-protective. Hence the explicit override.
 
