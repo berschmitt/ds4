@@ -61,6 +61,7 @@ Latest post-fusion sweep was kept as a run artifact instead of overwriting the c
 - `a865750` / related speed-bench commits: recommended q8 f16 cache policy and CSV baselines.
 - `1d35fbb`: pair decode q and kv q8 matvecs. Small but repeatable decode gain.
 - `5347041`: fuse decode Q head RMS norm and RoPE via existing CUDA helper. Small repeatable decode gain, with `DS4_METAL_DISABLE_Q_HEAD_ROPE_FUSION=1` as the reference fallback.
+- `codex/moe-decode-h16-lut`: half-warp MoE decode LUT gate/up kernel. Repeatable decode gain on RTX Pro 6000, with `DS4_CUDA_MOE_NO_DECODE_LUT_H16=1` as the reference fallback while this is being validated.
 
 Validation status for `5347041`:
 
