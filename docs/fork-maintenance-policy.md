@@ -31,6 +31,7 @@ Use these tiers when deciding what belongs on the active fork branch.
 | Pair decode q/kv q8 matvec (`1d35fbb`) | Drop unless retest shows larger value | Small decode gain, touches shared graph/API surface. Not worth carrying by default. |
 | Decode Q head RMS norm + RoPE fusion (`5347041`) | Drop unless part of a larger fusion plan | Small decode gain, touches shared graph/API surface. Keep result documented, but do not replay automatically. |
 | q8->f16 cache reserve policy | Keep as local runtime profile, not code default | Post-sync A/B: `128` MB is too aggressive and causes CUDA allocation failures; `512` MB preserves the upstream failure shape and gives the best prefill; `1024` MB leaves about 1 GiB free and is the safer general RTX Pro 6000 profile. |
+| Upstream PR #145 MoE down tile8 rowspan | Drop for RTX Pro 6000 profile | Opt-in A/B on `950e8e6` + PR #121 with `1024` MB reserve was slower on prefill and flat on generation. |
 | RTX Pro 6000 benchmark CSVs | Keep as historical artifacts | Useful for tracking what happened, but not a runtime policy. |
 | Bare-metal deployment / remote access docs | Keep local | Operationally important for this home-lab host; not intended as upstreamable code. |
 | Rejected top-k/indexer shortcuts | Historical only | Some showed speed signals, but correctness was not proven. Future work needs a non-perturbing comparison harness first. |
