@@ -96,11 +96,16 @@ If another DS4 or profiling job is already active, Codex should not start a comp
 
 ## Baseline DS4 environment
 
-Current correctness-safe RTX Pro 6000 defaults:
+Current RTX Pro 6000 reserve policy:
 
 ```bash
-# Do not set DS4_CUDA_Q8_F16_CACHE_RESERVE_MB for correctness-gated runs.
-# Low-reserve q8->f16 cache policies are historical performance probes only.
+# Upstream-comparison mode: leave DS4_CUDA_Q8_F16_CACHE_RESERVE_MB unset.
+
+# Local runtime profile: safer q8->f16 cache prefill recovery.
+export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=1024
+
+# Faster prefill experiment with tighter headroom:
+# export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512
 ```
 
 Build target:

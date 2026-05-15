@@ -30,7 +30,7 @@ Use these tiers when deciding what belongs on the active fork branch.
 | Half-warp MoE decode LUT (`8258aeb`, `da9a129`) | Candidate | Measured repeatable but modest decode gain. Retest after rebasing onto current upstream before keeping. |
 | Pair decode q/kv q8 matvec (`1d35fbb`) | Drop unless retest shows larger value | Small decode gain, touches shared graph/API surface. Not worth carrying by default. |
 | Decode Q head RMS norm + RoPE fusion (`5347041`) | Drop unless part of a larger fusion plan | Small decode gain, touches shared graph/API surface. Keep result documented, but do not replay automatically. |
-| Low-reserve q8->f16 cache policy (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`) | Drop as runtime policy | Prefill win, but fails long-context correctness. Historical benchmark only. |
+| q8->f16 cache reserve policy | Keep as local runtime profile, not code default | Post-sync A/B: `128` MB is too aggressive and causes CUDA allocation failures; `512` MB preserves the upstream failure shape and gives the best prefill; `1024` MB leaves about 1 GiB free and is the safer general RTX Pro 6000 profile. |
 | RTX Pro 6000 benchmark CSVs | Keep as historical artifacts | Useful for tracking what happened, but not a runtime policy. |
 | Bare-metal deployment / remote access docs | Keep local | Operationally important for this home-lab host; not intended as upstreamable code. |
 | Rejected top-k/indexer shortcuts | Historical only | Some showed speed signals, but correctness was not proven. Future work needs a non-perturbing comparison harness first. |

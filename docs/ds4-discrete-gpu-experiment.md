@@ -22,17 +22,24 @@ Fork hygiene and patch-carrying policy live in [fork-maintenance-policy.md](fork
 
 ## Required runtime policy
 
-Correctness-safe default for this 96 GB discrete card:
+Runtime reserve policy for this 96 GB discrete card:
 
 ```bash
-# Do not set DS4_CUDA_Q8_F16_CACHE_RESERVE_MB for correctness-gated runs.
-# Do not use the old 128 MB reserve policy as a default.
+# Upstream-comparison mode: leave unset.
+# This matches upstream behavior and keeps reserve tuning out of baseline A/B.
+
+# Local RTX Pro 6000 profile: safer prefill recovery.
+export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=1024
+
+# Benchmark/prefill-heavy experiment only: faster, tighter headroom.
+# export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512
 ```
 
 Why:
 
-- `./ds4_test --long-context` passes with the default q8->f16 cache reserve.
-- Lowering `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` improves prefill in short benchmarks, but it breaks the long-context correctness gate.
+- `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` is too aggressive on RTX Pro 6000: it improved prefill but produced CUDA allocation failures in `ds4_session_create`.
+- `512` MB preserves the same post-sync correctness failure shape as default reserve and gives the best prefill, but leaves only about 0.5 GiB free after q8->f16 cache population.
+- `1024` MB leaves about 1.0 GiB free, avoids allocation failures in the post-sync run, and still recovers a large fraction of the prefill performance.
 - `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1` is not useful as a default when the reserve is left alone, because the q8->f16 cache is already budget-exhausted before it can populate.
 - With upstream PR #121 applied, Blackwell-class CUDA skips the ordered one-token f16 matmul path by default. Set `DS4_CUDA_FORCE_ORDERED_F16_MATMUL=1` to restore the old ordered path for A/B.
 
@@ -74,6 +81,16 @@ Post-sync minimum batch on upstream `950e8e6`, before a fresh full sweep:
   - `ctx=4096`, 512 generated tokens: 353.85 prefill t/s, 44.03 gen t/s.
   - `ctx=32768`, 512 generated tokens: 343.45 prefill t/s, 39.08 gen t/s.
   - Decision: carry PR #121's Blackwell f16 behavior on the sync branch.
+
+Post-sync q8->f16 cache reserve A/B on upstream `950e8e6` plus PR #121:
+
+- Run: `~/ds4/codex-runs/20260515-194233-reserve-ab-sync-pr121`
+  - Default reserve: same 8-failure shape as upstream+PR121; `ctx=4096` 356.29 prefill t/s, 44.13 gen t/s; `ctx=32768` 345.15 prefill t/s, 39.10 gen t/s.
+  - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`: `ctx=4096` 521.70 prefill t/s, 43.97 gen t/s; `ctx=32768` 475.05 prefill t/s, 39.01 gen t/s; rejected because `make test` hit CUDA allocation failures during `ds4_session_create`.
+- Run: `~/ds4/codex-runs/20260515-195250-reserve-safe-search-sync-pr121`
+  - `512` MB: same 8-failure shape as default reserve; `ctx=4096` 500.55 prefill t/s, 44.00 gen t/s; `ctx=32768` 456.93 prefill t/s, 39.00 gen t/s.
+  - `1024` MB: no allocation failure and only the known `long_memory_archive` vector mismatches in this run; `ctx=4096` 473.04 prefill t/s, 43.98 gen t/s; `ctx=32768` 434.40 prefill t/s, 38.99 gen t/s.
+  - Decision: use `1024` MB as the safer local RTX Pro 6000 profile; keep `512` MB as an explicit benchmark/prefill-heavy experiment; do not use `128` MB.
 
 Historical low-reserve baseline, before the small decode Q norm+RoPE fusion. Keep this only as a performance artifact; it is not correctness-safe:
 
