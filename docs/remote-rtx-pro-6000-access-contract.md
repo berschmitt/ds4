@@ -96,11 +96,11 @@ If another DS4 or profiling job is already active, Codex should not start a comp
 
 ## Baseline DS4 environment
 
-Current recommended RTX Pro 6000 defaults:
+Current correctness-safe RTX Pro 6000 defaults:
 
 ```bash
-export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128
-export DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1
+# Do not set DS4_CUDA_Q8_F16_CACHE_RESERVE_MB for correctness-gated runs.
+# Low-reserve q8->f16 cache policies are historical performance probes only.
 ```
 
 Build target:
@@ -115,11 +115,11 @@ Token-byte parity remains the hard correctness gate:
 make test CUDA_ARCH=sm_120
 ```
 
-Known current caveat: upstream/current CUDA test status has a remaining `logprob-vectors` mismatch on `long_memory_archive`; this should be treated as a correctness investigation item, not ignored.
+Known current caveat: the CUDA long-context correctness path is marginal and includes the Alice wrong-assignment investigation tracked in `docs/ds4-discrete-gpu-experiment.md`; this should be treated as a correctness investigation item, not ignored.
 
 ## Current setup state
 
-As of 2026-05-14, the shared tmux/log setup exists:
+As of 2026-05-15, the shared tmux/log setup exists:
 
 - `tmux` session: `codex-ds4`
 - Latest log symlink: `~/ds4/codex-runs/latest`
