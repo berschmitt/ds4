@@ -3958,6 +3958,12 @@ int ds4_gpu_synchronize(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
 }
 
+int ds4_gpu_cuda_graph_capture_probe_enabled(void) { return 0; }
+int ds4_gpu_cuda_graph_capture_probe_active(void) { return 0; }
+int ds4_gpu_cuda_graph_capture_probe_begin(void) { return 1; }
+int ds4_gpu_cuda_graph_capture_probe_end(void) { return 1; }
+void ds4_gpu_cuda_graph_capture_probe_abort(void) {}
+
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
 

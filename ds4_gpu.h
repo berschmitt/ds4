@@ -36,6 +36,16 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* CUDA-only instrumentation hook. Non-CUDA backends return no-op success.
+ * When DS4_CUDA_GRAPH_CAPTURE_PROBE is set, ds4.c uses these around the
+ * one-token decode command region to test whether CUDA stream capture can
+ * legally capture and replay the steady-state decode tape. */
+int ds4_gpu_cuda_graph_capture_probe_enabled(void);
+int ds4_gpu_cuda_graph_capture_probe_active(void);
+int ds4_gpu_cuda_graph_capture_probe_begin(void);
+int ds4_gpu_cuda_graph_capture_probe_end(void);
+void ds4_gpu_cuda_graph_capture_probe_abort(void);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
