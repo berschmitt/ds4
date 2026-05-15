@@ -12647,9 +12647,24 @@ static bool metal_graph_eval_token_raw_swa(
         float                 *logits) {
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
+    const bool cuda_graph_probe = ds4_gpu_cuda_graph_capture_probe_enabled() != 0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    if (ok && cuda_graph_probe) ok = ds4_gpu_cuda_graph_capture_probe_begin() != 0;
+    const bool cuda_graph_capture_active = ds4_gpu_cuda_graph_capture_probe_active() != 0;
+    if (ok) {
+        ok = metal_graph_encode_token_raw_swa(g,
+                                             model,
+                                             weights,
+                                             token,
+                                             pos,
+                                             logits != NULL,
+                                             !cuda_graph_capture_active);
+    }
+    if (cuda_graph_probe) {
+        if (ok) ok = ds4_gpu_cuda_graph_capture_probe_end() != 0;
+        else ds4_gpu_cuda_graph_capture_probe_abort();
+    }
     const double t_encoded = profile ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = profile ? now_sec() : 0.0;

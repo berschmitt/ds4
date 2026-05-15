@@ -87,6 +87,12 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_cuda_sm_major;
 static int g_quality_mode;
+static int g_cuda_graph_probe_active;
+static uint64_t g_cuda_graph_probe_seen;
+static uint64_t g_cuda_graph_probe_skipped;
+static uint64_t g_cuda_graph_probe_captured;
+static uint64_t g_cuda_graph_probe_launched;
+static uint64_t g_cuda_graph_probe_failed;
 
 struct cuda_model_range {
     const void *host_base;
@@ -1213,6 +1219,16 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+static uint64_t cuda_parse_u64_env(const char *name, uint64_t def) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return def;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (errno != 0 || end == env) return def;
+    return (uint64_t)v;
+}
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -1235,6 +1251,15 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    if (getenv("DS4_CUDA_GRAPH_CAPTURE_PROBE") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA graph capture probe summary: seen=%llu skipped=%llu captured=%llu launched=%llu failed=%llu\n",
+                (unsigned long long)g_cuda_graph_probe_seen,
+                (unsigned long long)g_cuda_graph_probe_skipped,
+                (unsigned long long)g_cuda_graph_probe_captured,
+                (unsigned long long)g_cuda_graph_probe_launched,
+                (unsigned long long)g_cuda_graph_probe_failed);
+    }
     (void)cudaDeviceSynchronize();
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
@@ -1425,6 +1450,84 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+
+extern "C" int ds4_gpu_cuda_graph_capture_probe_enabled(void) {
+    return getenv("DS4_CUDA_GRAPH_CAPTURE_PROBE") != NULL;
+}
+
+extern "C" int ds4_gpu_cuda_graph_capture_probe_active(void) {
+    return g_cuda_graph_probe_active;
+}
+
+extern "C" int ds4_gpu_cuda_graph_capture_probe_begin(void) {
+    if (!ds4_gpu_cuda_graph_capture_probe_enabled()) return 1;
+    g_cuda_graph_probe_seen++;
+    const uint64_t skip = cuda_parse_u64_env("DS4_CUDA_GRAPH_CAPTURE_SKIP", 0);
+    if (g_cuda_graph_probe_seen <= skip) {
+        g_cuda_graph_probe_skipped++;
+        return 1;
+    }
+    if (g_cuda_graph_probe_active) {
+        fprintf(stderr, "ds4: CUDA graph capture probe already active\n");
+        g_cuda_graph_probe_failed++;
+        return 0;
+    }
+    cudaError_t err = cudaStreamBeginCapture(0, cudaStreamCaptureModeThreadLocal);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA graph capture begin failed: %s\n", cudaGetErrorString(err));
+        g_cuda_graph_probe_failed++;
+        return 0;
+    }
+    g_cuda_graph_probe_active = 1;
+    g_cuda_graph_probe_captured++;
+    if (getenv("DS4_CUDA_GRAPH_CAPTURE_VERBOSE") != NULL) {
+        fprintf(stderr, "ds4: CUDA graph capture probe begin #%llu\n",
+                (unsigned long long)g_cuda_graph_probe_seen);
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_cuda_graph_capture_probe_end(void) {
+    if (!ds4_gpu_cuda_graph_capture_probe_enabled() || !g_cuda_graph_probe_active) return 1;
+    cudaGraph_t graph = NULL;
+    cudaError_t err = cudaStreamEndCapture(0, &graph);
+    g_cuda_graph_probe_active = 0;
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA graph capture end failed: %s\n", cudaGetErrorString(err));
+        g_cuda_graph_probe_failed++;
+        return 0;
+    }
+
+    cudaGraphExec_t exec = NULL;
+    err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    if (err == cudaSuccess) err = cudaGraphLaunch(exec, 0);
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (exec) (void)cudaGraphExecDestroy(exec);
+    if (graph) (void)cudaGraphDestroy(graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA graph capture launch failed: %s\n", cudaGetErrorString(err));
+        g_cuda_graph_probe_failed++;
+        return 0;
+    }
+    g_cuda_graph_probe_launched++;
+    if (getenv("DS4_CUDA_GRAPH_CAPTURE_VERBOSE") != NULL) {
+        fprintf(stderr, "ds4: CUDA graph capture probe launched #%llu\n",
+                (unsigned long long)g_cuda_graph_probe_seen);
+    }
+    return 1;
+}
+
+extern "C" void ds4_gpu_cuda_graph_capture_probe_abort(void) {
+    if (!g_cuda_graph_probe_active) return;
+    cudaGraph_t graph = NULL;
+    cudaError_t err = cudaStreamEndCapture(0, &graph);
+    if (graph) (void)cudaGraphDestroy(graph);
+    g_cuda_graph_probe_active = 0;
+    g_cuda_graph_probe_failed++;
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA graph capture abort ended with: %s\n", cudaGetErrorString(err));
+    }
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
