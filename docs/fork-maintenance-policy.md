@@ -143,6 +143,7 @@ Performance deviation rule:
 - Patched correctness: same 8-failure shape; no new failure class.
 - Plain upstream performance: `ctx=4096` 356.39 prefill t/s, 42.08 gen t/s; `ctx=32768` 344.91 prefill t/s, 37.52 gen t/s.
 - Patched performance: `ctx=4096` 353.85 prefill t/s, 44.03 gen t/s; `ctx=32768` 343.45 prefill t/s, 39.08 gen t/s.
+- Local runtime-profile full sweep: `~/ds4/codex-runs/20260515-201808-official-sweep-reserve1024-sync-pr121`, copied to `speed-bench/rtx_pro_6000_reserve1024_sync_pr121_20260515.csv`; `ctx=32768` 414.59 prefill t/s, 39.42 gen t/s; `ctx=65536` 393.14 prefill t/s, 36.70 gen t/s.
 - Decision: carry PR #121 implementation; do not replay the old local `a486c90` interface.
 
 ## Practical branch model

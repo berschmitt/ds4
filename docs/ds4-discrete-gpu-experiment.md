@@ -45,6 +45,7 @@ Why:
 
 Canonical reference CSVs live in `speed-bench/`:
 
+- `rtx_pro_6000_reserve1024_sync_pr121_20260515.csv` - current local RTX Pro 6000 runtime profile
 - `rtx_pro_6000_default_reserve.csv`
 - `rtx_pro_6000_reserve_512mb.csv`
 - `rtx_pro_6000_reserve_128mb.csv`
@@ -62,7 +63,17 @@ Command:
   --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128
 ```
 
-Current correctness-safe baseline is the upstream-shaped sweep with the Blackwell generic f16 default patch:
+Current local RTX Pro 6000 runtime-profile baseline is upstream `950e8e6` plus PR #121 with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=1024`:
+
+- Run: `~/ds4/codex-runs/20260515-201808-official-sweep-reserve1024-sync-pr121`
+- CSV: `speed-bench/rtx_pro_6000_reserve1024_sync_pr121_20260515.csv`
+- Smoke: OK, `Hi there`, prefill 117.29 t/s, generation 55.38 t/s.
+- q8->f16 cache line during smoke: `cached=3.52 GiB`, `free=1.05 GiB`, `reserve=1.00 GiB`.
+- `ctx=2048`: 450.65 prefill t/s, 45.20 gen t/s
+- `ctx=32768`: 414.59 prefill t/s, 39.42 gen t/s
+- `ctx=65536`: 393.14 prefill t/s, 36.70 gen t/s
+
+Previous upstream-shaped sweep with the Blackwell generic f16 default patch:
 
 - Run: `~/ds4/codex-runs/20260515-003703-f16-default-official-sweep`
 - CSV: `speed-bench/rtx_pro_6000_f16_default_official_65536_20260515.csv`
