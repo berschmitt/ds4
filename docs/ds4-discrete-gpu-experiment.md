@@ -34,7 +34,7 @@ Why:
 - `./ds4_test --long-context` passes with the default q8->f16 cache reserve.
 - Lowering `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` improves prefill in short benchmarks, but it breaks the long-context correctness gate.
 - `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1` is not useful as a default when the reserve is left alone, because the q8->f16 cache is already budget-exhausted before it can populate.
-- On Blackwell CUDA (`sm_12x`), one-token f16 matvecs now default to the generic 256-thread path. Set `DS4_CUDA_USE_ORDERED_F16_MATMUL=1` to restore the old ordered 32-thread path for A/B.
+- With upstream PR #121 applied, Blackwell-class CUDA skips the ordered one-token f16 matmul path by default. Set `DS4_CUDA_FORCE_ORDERED_F16_MATMUL=1` to restore the old ordered path for A/B.
 
 Canonical reference CSVs live in `speed-bench/`:
 
@@ -62,6 +62,18 @@ Current correctness-safe baseline is the upstream-shaped sweep with the Blackwel
 - `ctx=2048`: 497.56 prefill t/s, 46.74 gen t/s
 - `ctx=32768`: 459.76 prefill t/s, 40.74 gen t/s
 - `ctx=65536`: 437.33 prefill t/s, 37.88 gen t/s
+
+Post-sync minimum batch on upstream `950e8e6`, before a fresh full sweep:
+
+- Plain upstream run: `~/ds4/codex-runs/20260515-185234-post-sync-upstream`
+  - Correctness: build/smoke OK; `make test` reports 8 failures, including Alice long-context wrong assignment and `long_memory_archive` logprob-vector mismatches.
+  - `ctx=4096`, 512 generated tokens: 356.39 prefill t/s, 42.08 gen t/s.
+  - `ctx=32768`, 512 generated tokens: 344.91 prefill t/s, 37.52 gen t/s.
+- Upstream plus PR #121 run: `~/ds4/codex-runs/20260515-185923-post-sync-f16-pr121`
+  - Correctness: same 8-failure shape as plain upstream; no new failure class.
+  - `ctx=4096`, 512 generated tokens: 353.85 prefill t/s, 44.03 gen t/s.
+  - `ctx=32768`, 512 generated tokens: 343.45 prefill t/s, 39.08 gen t/s.
+  - Decision: carry PR #121's Blackwell f16 behavior on the sync branch.
 
 Historical low-reserve baseline, before the small decode Q norm+RoPE fusion. Keep this only as a performance artifact; it is not correctness-safe:
 
@@ -149,12 +161,13 @@ Decision rule:
   - `ctx=4096`: about 43.8 gen t/s vs 42.6 fallback.
   - `ctx=32768`: about 38.6 gen t/s vs 37.7 fallback.
   - `ctx=131072`: 31.51 gen t/s vs 30.81 fallback in a one-run smoke.
-- `a486c90`: use generic one-token f16 matvecs by default on Blackwell CUDA, with `DS4_CUDA_USE_ORDERED_F16_MATMUL=1` as the old-path fallback:
+- `upstream-pr/121` / local sync commit `81aa629`: skip ordered one-token f16 matvecs on Blackwell CUDA, with `DS4_CUDA_FORCE_ORDERED_F16_MATMUL=1` as the old-path fallback:
   - Discovery run: `~/ds4/codex-runs/20260515-000626-ctx32768-router-f16-ab`.
   - Repeat run: `~/ds4/codex-runs/20260515-001905-f16-generic-repeat`.
   - Validation run: `~/ds4/codex-runs/20260515-002919-f16-default-validation`.
   - `ctx=4096`: 45.90 gen t/s default vs 43.82 old ordered fallback.
   - `ctx=32768`: 40.33 gen t/s default vs 38.59 old ordered fallback.
+  - Post-sync validation on upstream `950e8e6`: `ctx=4096` 44.03 gen t/s vs 42.08 upstream-only; `ctx=32768` 39.08 gen t/s vs 37.52 upstream-only.
 
 Validation status for `5347041`:
 
@@ -250,13 +263,13 @@ Long-context stability follow-up:
 
 Upstream status as of 2026-05-14: upstream has new server/API commits plus `04b6fda` (`cuda: use managed KV cache for huge contexts`). That CUDA change is scoped to very large KV caches and should not affect the current 32k/65k benchmark phase. Treat it as a separate long-context stability item, not as part of the RTX Pro 6000 throughput work, and verify carefully before merging because managed KV can trade performance for allocation survivability.
 
-At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. At `ctx=32768`, the Blackwell f16 default patch reaches 40.74 t/s versus the upstream DGX Spark row at 13.75 t/s: about 3.0x, still below the broad 4x compute-ratio target band.
+At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. The earlier full sweep with the Blackwell f16 default patch reached 40.74 t/s at `ctx=32768`; the 2026-05-15 post-sync minimum batch on upstream `950e8e6` plus PR #121 reached 39.08 t/s with 512 generated tokens. Both are about 2.8-3.0x the upstream DGX Spark row at 13.75 t/s, still below the broad 4x compute-ratio target band.
 
 ## Upstream PR watchlist
 
 As of 2026-05-15, upstream has many open PRs. Relevant ones for this fork:
 
-- [#121 cuda: skip ordered f16 matmul on Blackwell](https://github.com/antirez/ds4/pull/121): aligns with our independently validated Blackwell f16 default patch. Track for upstream merge/rebase cleanup.
+- [#121 cuda: skip ordered f16 matmul on Blackwell](https://github.com/antirez/ds4/pull/121): adopted on the sync branch after post-sync validation. Track for upstream merge/rebase cleanup so we can drop the local cherry-pick later.
 - [#145 cuda: add launch-bounded tile8 MoE down path](https://github.com/antirez/ds4/pull/145): opt-in `DS4_CUDA_MOE_DOWN_TILE8_ROWSPAN` path layered on #121. Worth a quick RTX Pro 6000 A/B because it targets a real decode bucket, but only keep if it moves `ctx=32768`, 512-token generation by a repeatable margin.
 - [#153 cuda: add direct-model partial weight cache](https://github.com/antirez/ds4/pull/153): important for 24 GB direct-model users. Not a primary RTX Pro 6000 target because our card can hold the full 80.76 GiB model image in VRAM, but the dense-weight prioritization is useful background for future cache policy thinking.
 - [#158 cuda: fix HMM path on coherent unified-memory systems](https://github.com/antirez/ds4/pull/158): GB10 / coherent unified-memory path, not a discrete RTX Pro 6000 path. Track only to avoid accidentally importing unified-memory assumptions.

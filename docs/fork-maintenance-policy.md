@@ -26,7 +26,7 @@ Use these tiers when deciding what belongs on the active fork branch.
 
 | Change | Current decision | Why |
 | --- | --- | --- |
-| Blackwell one-token f16 matvec default (`a486c90`) | Keep concept, prefer upstream PR #121 shape | Clear RTX Pro 6000 generation gain. Upstream has the same idea in `upstream-pr/121`, so avoid carrying a divergent interface long term. |
+| Blackwell one-token f16 matvec default (`upstream-pr/121`) | Adopted until upstream merges it | Post-sync A/B on `950e8e6`: same correctness failure shape as upstream-only, `ctx=4096` generation `42.08 -> 44.03` t/s, `ctx=32768` generation `37.52 -> 39.08` t/s. |
 | Half-warp MoE decode LUT (`8258aeb`, `da9a129`) | Candidate | Measured repeatable but modest decode gain. Retest after rebasing onto current upstream before keeping. |
 | Pair decode q/kv q8 matvec (`1d35fbb`) | Drop unless retest shows larger value | Small decode gain, touches shared graph/API surface. Not worth carrying by default. |
 | Decode Q head RMS norm + RoPE fusion (`5347041`) | Drop unless part of a larger fusion plan | Small decode gain, touches shared graph/API surface. Keep result documented, but do not replay automatically. |
@@ -130,6 +130,20 @@ Performance deviation rule:
 - Re-run if generation drops by 2% or more at `ctx=32768`.
 - Block promotion and investigate if a repeated run drops generation by 3% or more, or if prefill drops by 5% or more without an understood reason.
 - Always record both the upstream baseline and patched result in the experiment doc or a post-sync run note.
+
+## Last sync record
+
+2026-05-15 sync onto upstream `950e8e6`:
+
+- Archive branch: `archive/pre-sync-20260515`.
+- Active sync branch: `codex/upstream-sync-20260515`.
+- Plain upstream run: `~/ds4/codex-runs/20260515-185234-post-sync-upstream`.
+- Patched run with upstream PR #121: `~/ds4/codex-runs/20260515-185923-post-sync-f16-pr121`.
+- Plain upstream correctness: build/smoke OK, `make test` reports 8 failures: Alice long-context wrong assignment plus `long_memory_archive` logprob-vector mismatches.
+- Patched correctness: same 8-failure shape; no new failure class.
+- Plain upstream performance: `ctx=4096` 356.39 prefill t/s, 42.08 gen t/s; `ctx=32768` 344.91 prefill t/s, 37.52 gen t/s.
+- Patched performance: `ctx=4096` 353.85 prefill t/s, 44.03 gen t/s; `ctx=32768` 343.45 prefill t/s, 39.08 gen t/s.
+- Decision: carry PR #121 implementation; do not replay the old local `a486c90` interface.
 
 ## Practical branch model
 
