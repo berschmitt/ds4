@@ -306,6 +306,17 @@ As of 2026-05-15, upstream has many open PRs. Relevant ones for this fork:
 
 No open upstream PR in this scan appears to implement NVIDIA CUDA Graph capture/replay for DS4.
 
+Fresh post-sync decode profile with the local `1024` MB reserve profile:
+
+- Stage-profile run: `~/ds4/codex-runs/20260515-214328-decode-profile-reserve1024-sync-pr121`
+  - Profiled result with overhead: 64 generated tokens, about 20.55 ms/token, about 48.67 gen t/s.
+  - Top DS4 stage buckets: routed MoE 20.9%, attention output 12.7%, FFN HC pre 12.0%, attention HC pre 12.0%, q path 10.4%, attention 9.0%, compressor/indexer 7.0%.
+- Representative long Nsight run: `~/ds4/codex-runs/20260515-214643-decode-nsys-long-reserve1024-sync-pr121`
+  - Prompt forced a full 256-token generation; measured generation 52.87 t/s under Nsight.
+  - Top CUDA kernel buckets: `matmul_f16_kernel` 18.1%, `moe_gate_up_mid_decode_lut_qwarp32_kernel` 16.1%, `attention_decode_mixed_kernel` 11.9%, q8 matvec warp path 9.5%, HC q8 expansion 7.8%, RMS norm 6.8%, grouped q8 matvec 6.2%.
+  - CUDA API summary: about 450k `cudaLaunchKernel` calls and 519 `cudaDeviceSynchronize` calls in the profiled process. The sync time mostly waits for GPU work, but the launch count confirms severe decode fragmentation.
+  - Source scan found no NVIDIA CUDA Graph capture/replay API use (`cudaGraph*`, stream capture, or `cudaGraphLaunch`). DS4's "graph" terminology is its internal execution tape, not CUDA Graph replay.
+
 `ctx=32768` decode stage profile:
 
 - Run: `~/ds4/codex-runs/20260514-225658-ctx32768-decode-stage-profile`
@@ -381,36 +392,35 @@ This points to general decode kernel fragmentation plus real q8/MoE/matvec kerne
 
 Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream benchmark shape first, then re-check longer contexts. Do not spend time on changes that only move short-prompt smoke tests.
 
-1. **Long-context exactness probe**
-   - The Alice wrong-assignment failure is now the gating issue for both prefill-cache recovery and decode speed patches.
-   - Stop treating `./ds4_test --long-context` as only a pass/fail gate. Add or use instrumentation that captures the generated text/logit path around the Alice fact so we can identify where the CUDA path diverges.
-   - Until this is understood, do not promote low-reserve q8 f16 cache policy or top-k shortcuts as correctness-safe.
-
-2. **CUDA Graph replay feasibility**
+1. **CUDA Graph replay feasibility**
    - LnaLang4U reports a large CUDA Graphs ON/OFF gap on RTX Pro 6000-class hardware, and DS4 still launches many small decode kernels per token.
    - Do not assume DS4 can get the same gain as SGLang/PyTorch: DS4 is native C/CUDA and already avoids a lot of framework overhead.
-   - First step: make a minimal decode capture/replay feasibility probe for a fixed benchmark shape, or prove exactly which token-varying state prevents capture.
+   - Fresh source scan found no current CUDA Graph capture/replay path. First step: make a minimal decode capture/replay feasibility probe for a fixed benchmark shape, or prove exactly which token-varying state prevents capture.
    - Success criterion is practical: a repeatable generation gain at `ctx=32768`, not a synthetic launch-count reduction.
 
-3. **Benchmark calibration against external references**
+2. **Largest GPU-time buckets**
+   - The post-sync 1024 MB Nsight run ranks the big buckets as f16 matvecs, MoE gate/up decode, attention decode, q8 matvecs, HC expansion, and RMS norms.
+   - Work from this ranking. Avoid revisiting small toggles that do not touch these buckets.
+   - First concrete subtarget after CUDA Graph feasibility is either f16 matvec batching/fusion or MoE gate/up decode, because they are the two largest stable kernel buckets.
+
+3. **Indexed attention / indexer redesign**
+   - Indexed attention / dense attention / top-k remain material at longer context, and attention becomes more important as context grows.
+   - Built-in fallback toggles and single-token grouped-head routing did not help.
+   - Future top-k work needs a correctness-preserving harness under the default/upstream-comparison reserve before accepting any sorter shortcut.
+
+4. **Long-context exactness probe**
+   - The Alice wrong-assignment failure is now present in upstream-shaped CUDA runs too, so treat it as a correctness track instead of assuming every performance patch caused it.
+   - Stop treating `./ds4_test --long-context` as only a pass/fail gate. Add or use instrumentation that captures the generated text/logit path around the Alice fact so we can identify where the CUDA path diverges.
+   - Performance patches must preserve the known correctness shape; changes that add allocation failures or new mismatch classes are rejected.
+
+5. **Benchmark calibration against external references**
    - Run or reproduce an apples-to-apples DS4 server benchmark where possible, especially `llama-benchy`-style steady-state `tg`, because DS4's average generation metric and forum/README metrics are not always the same.
    - Keep the 2-card, roughly 4-bit RTX Pro 6000 reports as perspective, not as a direct target for the 1-card roughly 2-bit DS4 path.
    - Maintain the target bands: below 50 t/s is not enough; 55-65 t/s is the first acceptable generation band; 70-80 t/s is the strong target.
 
-4. **Selective q8 f16 cache recovery**
-   - Prefill is important, and the low-reserve policy showed the upside. The problem is exactness, not lack of speed.
-   - After the exactness probe exists, re-test q8 f16 caching by tensor group/label rather than blunt reserve size.
-   - Goal: recover safe prefill wins while preserving the Alice long-context behavior.
-
-5. **Indexed attention / indexer redesign**
-   - Highest combined decode target after the patched Nsight profile: indexed attention, dense attention, top-k chunk/merge, and indexer score/direct kernels.
-   - Built-in fallback toggles and single-token grouped-head routing did not help.
-   - Three top-k sorter shortcuts produced real speed signals, but their long-context failures may have been contaminated by the now-invalid low-reserve policy.
-   - Next useful work here is a correctness-preserving harness under the default reserve. First prove the harness is a no-op by passing `./ds4_test --long-context` with no fast-path env var, then compare selected index/order behavior against the current chunked path before accepting any top-k or attention-gather speedup.
-
 6. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.
-   - First concrete task: inspect current fused MoE helpers and their launch count before writing new kernels.
+   - PR #145 did not help the RTX Pro 6000 profile because it targeted a batched/prefill-style MoE down path. Future MoE work should focus on the decode gate/up LUT path first.
    - Keep only changes that improve `ctx=32768`, 512-token generation by a repeatable margin.
 
 7. **q8 decode matvec path**
