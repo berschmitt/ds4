@@ -118,6 +118,8 @@ Long-context behavior remains important, but it is a second-stage acceptance tie
   - `ctx=4096`: about 43.8 gen t/s vs 42.6 fallback.
   - `ctx=32768`: about 38.6 gen t/s vs 37.7 fallback.
   - `ctx=131072`: 31.51 gen t/s vs 30.81 fallback in a one-run smoke.
+  - Current-main repeat run `~/ds4/codex-runs/20260516-025919-moe-h16-repeat`: `ctx=4096`, 512-token generation averaged 45.79 t/s with H16 vs 44.33 t/s with `DS4_CUDA_MOE_NO_DECODE_LUT_H16=1`, about +3.3%.
+  - MoE decode policy run `~/ds4/codex-runs/20260516-025250-moe-decode-policy`: disabling the decode LUT gate entirely was much slower (`34.55` t/s), while disabling direct down-sum6 was noise-level (`45.93` t/s vs base `45.83`). No existing MoE env switch is an obvious new default.
 - Pending f16 default patch: use generic one-token f16 matvecs by default on Blackwell CUDA, with `DS4_CUDA_USE_ORDERED_F16_MATMUL=1` as the old-path fallback:
   - Discovery run: `~/ds4/codex-runs/20260515-000626-ctx32768-router-f16-ab`.
   - Repeat run: `~/ds4/codex-runs/20260515-001905-f16-generic-repeat`.
