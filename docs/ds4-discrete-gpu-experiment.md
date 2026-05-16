@@ -370,6 +370,9 @@ Temporary f16 matmul shape stats:
 - `ctx=32768`: 511.15 prefill t/s, 40.42 gen t/s.
 - Summary: 15 f16 matmul shapes, 157,618 calls, about 18.8T estimated FMAs across prefill plus generation.
 - Largest shapes are `4096x1024`, `1024x8192`, `4096x256`, `4096x512`, and `16384x24`. This confirms f16 work is concentrated in known compressor/indexer/router/HC projections, not an unknown allocation fallback.
+- `codex/f16-decode-matvec-investigation` added an opt-in single-token f16 cuBLAS path. All-shape cuBLAS is fast but not currently promotable: run `~/ds4/codex-runs/20260516-015010-f16-single-cublas-ab` improved generation from `44.29 -> 49.12` t/s at `ctx=4096` and `39.04 -> 42.81` t/s at `ctx=32768`, but `DS4_CUDA_F16_SINGLE_CUBLAS=1 ./ds4_test --long-context` failed in `~/ds4/codex-runs/20260516-015615-f16-single-cublas-correctness`.
+- Shape-gated follow-up: `~/ds4/codex-runs/20260516-020244-f16-cublas-shape-matrix` showed the HC mix shape (`16384x24`) carries most of the safe-looking speed signal at `ctx=4096`: control `44.20` t/s, `hc` `47.76`, `hc,indexer` `48.05`, `all` `49.11`. Long-context benchmark `~/ds4/codex-runs/20260516-020821-f16-hc-long-ab` repeated the signal at `ctx=32768`: control `39.05`, `hc` `41.88`, `hc,indexer` `42.14`.
+- Correctness status for the HC-gated path is unresolved, not cleanly failed: `~/ds4/codex-runs/20260516-021644-f16-hc-correctness` had control, `hc`, and `hc,indexer` all fail the same Alice long-context check; `~/ds4/codex-runs/20260516-022413-f16-hc-logprob` had control, `hc`, and `hc,indexer` all fail the same 7 `long_memory_archive` logprob-vector checks. This means the HC cuBLAS path is a strong performance candidate, but it needs a better exactness harness before becoming default.
 
 Nsight on a decode-focused fixed-token bench:
 
