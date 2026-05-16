@@ -199,6 +199,13 @@ Current-main repeat after upstream MoE H16 and Blackwell f16 work:
 - Largest GPU kernel buckets: f16 matvec 19.1%, attention decode 13.5%, MoE H16 gate/up 13.1%, HC q8 expansion 8.1%, q8 matvec 7.7%, RMS norm 7.1%, grouped q8 matvec 6.4%.
 - Interpretation: short-context decode now reaches the first target band, but the official `ctx=32768` benchmark still sits around the low-40s. The remaining problem is not just per-token core compute; longer-context attention/indexer/cache behavior still matters.
 
+Delayed Nsight capture for generation at `ctx=4096`:
+
+- Run: `~/ds4/codex-runs/20260516-032356-current-main-delayed-nsys-ctx4096`
+- `ctx=4096`: 45.64 gen t/s
+- Largest mostly-generation GPU buckets: f16 matvec 17.9%, indexed attention 17.6%, MoE H16 gate/up 10.7%, HC q8 expansion 6.6%, q8 matvec 6.3%, dense attention 5.9%, RMS norm 5.7%, grouped q8 matvec 5.4%.
+- Interpretation: the short-context to 4k drop is attention/indexer-sensitive. F16 is still large, but attention becomes a co-leader once enough context is present.
+
 This points to general decode kernel fragmentation plus real q8/MoE/matvec kernel time. More one-launch micro-fusions will help only marginally unless they sit on a high-count, high-time path.
 
 ## Next engineering targets
@@ -211,6 +218,7 @@ This points to general decode kernel fragmentation plus real q8/MoE/matvec kerne
 
 2. **Attention/indexer replacement, not fallback toggles**
    - Built-in fallback toggles did not improve generation at `ctx=32768`.
+   - The delayed `ctx=4096` profile puts indexed attention level with f16 matvecs, so this is now the main context-scaling target.
    - Any useful work here needs a real top-k / indexed-attention kernel replacement or fusion, not disabling the current fast paths.
 
 3. **MoE/shared decode kernels**
