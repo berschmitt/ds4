@@ -88,9 +88,12 @@ static int g_cublas_ready;
 static int g_cuda_sm_major;
 static int g_quality_mode;
 static int g_cuda_graph_probe_active;
+static cudaGraphExec_t g_cuda_graph_probe_exec;
 static uint64_t g_cuda_graph_probe_seen;
 static uint64_t g_cuda_graph_probe_skipped;
 static uint64_t g_cuda_graph_probe_captured;
+static uint64_t g_cuda_graph_probe_instantiated;
+static uint64_t g_cuda_graph_probe_updated;
 static uint64_t g_cuda_graph_probe_launched;
 static uint64_t g_cuda_graph_probe_failed;
 
@@ -1253,14 +1256,20 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     if (getenv("DS4_CUDA_GRAPH_CAPTURE_PROBE") != NULL) {
         fprintf(stderr,
-                "ds4: CUDA graph capture probe summary: seen=%llu skipped=%llu captured=%llu launched=%llu failed=%llu\n",
+                "ds4: CUDA graph capture probe summary: seen=%llu skipped=%llu captured=%llu instantiated=%llu updated=%llu launched=%llu failed=%llu\n",
                 (unsigned long long)g_cuda_graph_probe_seen,
                 (unsigned long long)g_cuda_graph_probe_skipped,
                 (unsigned long long)g_cuda_graph_probe_captured,
+                (unsigned long long)g_cuda_graph_probe_instantiated,
+                (unsigned long long)g_cuda_graph_probe_updated,
                 (unsigned long long)g_cuda_graph_probe_launched,
                 (unsigned long long)g_cuda_graph_probe_failed);
     }
     (void)cudaDeviceSynchronize();
+    if (g_cuda_graph_probe_exec) {
+        (void)cudaGraphExecDestroy(g_cuda_graph_probe_exec);
+        g_cuda_graph_probe_exec = NULL;
+    }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -1498,14 +1507,41 @@ extern "C" int ds4_gpu_cuda_graph_capture_probe_end(void) {
         return 0;
     }
 
+    const int update_probe = getenv("DS4_CUDA_GRAPH_CAPTURE_UPDATE_PROBE") != NULL;
     cudaGraphExec_t exec = NULL;
-    err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    if (update_probe) {
+        if (!g_cuda_graph_probe_exec) {
+            err = cudaGraphInstantiate(&g_cuda_graph_probe_exec, graph, NULL, NULL, 0);
+            if (err == cudaSuccess) g_cuda_graph_probe_instantiated++;
+        } else {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+            cudaGraphExecUpdateResultInfo update_info;
+            memset(&update_info, 0, sizeof(update_info));
+            err = cudaGraphExecUpdate(g_cuda_graph_probe_exec, graph, &update_info);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA graph capture update failed: %s result=%d\n",
+                        cudaGetErrorString(err),
+                        (int)update_info.result);
+            } else {
+                g_cuda_graph_probe_updated++;
+            }
+#else
+            fprintf(stderr, "ds4: CUDA graph capture update probe requires CUDA runtime 13+\n");
+            err = cudaErrorNotSupported;
+#endif
+        }
+        exec = g_cuda_graph_probe_exec;
+    } else {
+        err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+        if (err == cudaSuccess) g_cuda_graph_probe_instantiated++;
+    }
     if (err == cudaSuccess) err = cudaGraphLaunch(exec, 0);
     if (err == cudaSuccess) err = cudaDeviceSynchronize();
-    if (exec) (void)cudaGraphExecDestroy(exec);
+    if (!update_probe && exec) (void)cudaGraphExecDestroy(exec);
     if (graph) (void)cudaGraphDestroy(graph);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA graph capture launch failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "ds4: CUDA graph capture/update/launch failed: %s\n", cudaGetErrorString(err));
         g_cuda_graph_probe_failed++;
         return 0;
     }
