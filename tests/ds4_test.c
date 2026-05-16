@@ -348,6 +348,16 @@ static void test_long_story_fact_recall(void) {
     }
 
     const char *text = out.ptr ? out.ptr : "";
+    const char *dump_path = getenv("DS4_TEST_LONG_OUTPUT_PATH");
+    if (dump_path && dump_path[0]) {
+        FILE *fp = fopen(dump_path, "wb");
+        if (fp) {
+            fwrite(text, 1, strlen(text), fp);
+            fclose(fp);
+        } else {
+            fprintf(stderr, "ds4-test: failed to write long-context output to %s\n", dump_path);
+        }
+    }
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(generated > 0);
     for (size_t i = 0; i < sizeof(test_long_facts) / sizeof(test_long_facts[0]); i++) {
