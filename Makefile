@@ -22,10 +22,14 @@ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
+CUDA_DEFAULT_STREAM ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
-NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+ifneq ($(strip $(CUDA_DEFAULT_STREAM)),)
+NVCC_STREAM_FLAGS := --default-stream $(CUDA_DEFAULT_STREAM)
+endif
+NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) $(NVCC_STREAM_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 CORE_OBJS = ds4.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o
@@ -72,6 +76,7 @@ help:
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
+	@echo "  make cuda CUDA_ARCH=sm_N CUDA_DEFAULT_STREAM=per-thread"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, and ./ds4-eval"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
@@ -88,7 +93,7 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
-	$(MAKE) ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH="$(CUDA_ARCH)" CUDA_DEFAULT_STREAM="$(CUDA_DEFAULT_STREAM)"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
