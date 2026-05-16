@@ -363,6 +363,7 @@ MoE profile at `ctx=32768`, 64 generated tokens:
 - Decode MoE calls: 2752 calls, 235.650 ms total, about 3.68 ms/token.
 - Decode MoE breakdown: gate/up 156.193 ms (66.28%), down 54.898 ms (23.30%), x quant 11.008 ms (4.67%), mid quant 11.008 ms (4.67%), sort effectively zero.
 - Conclusion: MoE gate/up is the MoE subtarget, but total MoE time is not large enough to explain the full gap to the 55-65 t/s target by itself.
+- Existing MoE decode policy switches, run `~/ds4/codex-runs/20260516-025250-moe-decode-policy` on current `main` (`a486c90`), did not reveal a default-toggle win: base `45.83` t/s, disabling decode LUT gate `34.55`, disabling direct down-sum6 `45.93`, disabling both `34.58`, writing aux gate/up `45.71`. The decode LUT gate is critical on RTX Pro 6000; direct down-sum6 and aux writes are noise-level for this benchmark.
 
 Temporary f16 matmul shape stats:
 
