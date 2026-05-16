@@ -6048,7 +6048,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_router &&
         n_tok == 1u &&
         !cuda_skip_ordered_f16_matmul();
-    if (!serial_f16 && g_cublas_ready && n_tok > 1) {
+    const int single_cublas =
+        n_tok == 1u &&
+        getenv("DS4_CUDA_F16_SINGLE_CUBLAS") != NULL;
+    if (!serial_f16 && g_cublas_ready && (n_tok > 1 || single_cublas)) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
