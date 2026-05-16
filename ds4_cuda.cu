@@ -515,6 +515,37 @@ static int cuda_skip_ordered_f16_matmul(void) {
     return g_cuda_sm_major >= 11;
 }
 
+static int cuda_env_has_word(const char *env, const char *word) {
+    return env && word && strstr(env, word) != NULL;
+}
+
+static int cuda_f16_single_cublas_allowed(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    if (n_tok != 1u) return 0;
+    if (getenv("DS4_CUDA_F16_SINGLE_CUBLAS") != NULL) return 1;
+    const char *env = getenv("DS4_CUDA_F16_SINGLE_CUBLAS_SHAPES");
+    if (!env || !env[0]) return 0;
+    if (cuda_env_has_word(env, "all")) return 1;
+    if (cuda_env_has_word(env, "hc") &&
+        in_dim == 16384u && out_dim == 24u) {
+        return 1;
+    }
+    if (cuda_env_has_word(env, "router") &&
+        in_dim == 4096u && out_dim == 256u) {
+        return 1;
+    }
+    if (cuda_env_has_word(env, "compressor") &&
+        in_dim == 4096u &&
+        (out_dim == 1024u || out_dim == 512u || out_dim == 256u)) {
+        return 1;
+    }
+    if (cuda_env_has_word(env, "indexer") &&
+        ((in_dim == 1024u && out_dim == 8192u) ||
+         (in_dim == 4096u && out_dim == 64u))) {
+        return 1;
+    }
+    return 0;
+}
+
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
         getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
@@ -6048,9 +6079,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_router &&
         n_tok == 1u &&
         !cuda_skip_ordered_f16_matmul();
-    const int single_cublas =
-        n_tok == 1u &&
-        getenv("DS4_CUDA_F16_SINGLE_CUBLAS") != NULL;
+    const int single_cublas = cuda_f16_single_cublas_allowed(in_dim, out_dim, n_tok);
     if (!serial_f16 && g_cublas_ready && (n_tok > 1 || single_cublas)) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
