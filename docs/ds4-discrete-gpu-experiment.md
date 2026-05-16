@@ -146,6 +146,10 @@ Validation status for `5347041`:
   - `DS4_CUDA_NO_INDEXER_WMMA=1`: no generation gain, prefill collapsed to 143.91 t/s.
   - `DS4_CUDA_NO_TOPK8192=1`: no generation gain.
   - `DS4_CUDA_NO_TOPK_CHUNKED=1`: clearly slow fallback; do not pursue unless there is a specific top-k replacement patch to test.
+- `codex/indexed-attn-heads8-decode-ab`: allowed single-token decode to opt into the existing grouped `attention_indexed_mixed_heads8_online_kernel` via `DS4_CUDA_INDEXED_HEADS8_DECODE=1`. Smoke passed, but performance did not justify the path; run `~/ds4/codex-runs/20260516-033124-indexed-heads8-decode-ab`:
+  - `ctx=64`, 3 runs: baseline 56.77 gen t/s, candidate 56.76 gen t/s.
+  - `ctx=4096`, 3 runs: baseline 45.75 gen t/s, candidate 43.77 gen t/s.
+  - Interpretation: grouping heads with the existing online kernel is neutral at tiny context and slower once indexed attention matters. Do not pursue this as a simple guard change; a useful attention/indexer patch needs a decode-specific kernel design.
 
 Operational note: future fallback-disabling probes should use shorter generation counts first. Slow fallback checks are useful negative results, but they should not occupy the GPU for long unless the early result shows a plausible gain.
 
@@ -201,6 +205,7 @@ This points to general decode kernel fragmentation plus real q8/MoE/matvec kerne
 
 2. **Attention/indexer replacement, not fallback toggles**
    - Built-in fallback toggles did not improve generation at `ctx=32768`.
+   - Reusing the existing grouped heads8 online indexed-attention kernel for single-token decode was slower at `ctx=4096`.
    - Any useful work here needs a real top-k / indexed-attention kernel replacement or fusion, not disabling the current fast paths.
 
 3. **MoE/shared decode kernels**
