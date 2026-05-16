@@ -155,7 +155,7 @@ Operational note: future fallback-disabling probes should use shorter generation
 
 The initial WSL2 path was not representative. Bare-metal Ubuntu removed the catastrophic WSL2 behavior and brought generation to roughly 38-43 t/s depending on context.
 
-Remaining decode performance is not dominated by one obvious allocation fallback. The q8 f16 cache still fills only a few GiB because the 80.76 GiB model plus context/scratch leaves limited spare VRAM, but the measured fallback shape is stable and partially mitigated by the 128 MB reserve plus no-attention-output policy.
+Remaining decode performance is not dominated by one obvious allocation fallback. The q8 f16 cache still fills only a few GiB because the 80.76 GiB model plus context/scratch leaves limited spare VRAM, but the measured fallback shape is stable. Low-reserve q8 f16 cache policies are useful probes, not correctness defaults.
 
 Upstream status as of 2026-05-14: upstream has new server/API commits plus `04b6fda` (`cuda: use managed KV cache for huge contexts`). That CUDA change is scoped to very large KV caches and should not affect the current 32k/65k benchmark phase. Treat it as a separate long-context stability item, not as part of the RTX Pro 6000 throughput work, and verify carefully before merging because managed KV can trade performance for allocation survivability.
 
@@ -192,14 +192,21 @@ Observed run:
 - CUDA launches: about 799k for the profiled process
 - Largest GPU kernel buckets: MoE decode, f16 ordered matmuls, attention decode, q8 matvecs, HC expansion, RMS norms
 
+Current-main repeat after upstream MoE H16 and Blackwell f16 work:
+
+- Run: `~/ds4/codex-runs/20260516-030758-current-main-nsys-decode64`
+- `ctx=64`: 55.96 gen t/s
+- Largest GPU kernel buckets: f16 matvec 19.1%, attention decode 13.5%, MoE H16 gate/up 13.1%, HC q8 expansion 8.1%, q8 matvec 7.7%, RMS norm 7.1%, grouped q8 matvec 6.4%.
+- Interpretation: short-context decode now reaches the first target band, but the official `ctx=32768` benchmark still sits around the low-40s. The remaining problem is not just per-token core compute; longer-context attention/indexer/cache behavior still matters.
+
 This points to general decode kernel fragmentation plus real q8/MoE/matvec kernel time. More one-launch micro-fusions will help only marginally unless they sit on a high-count, high-time path.
 
 ## Next engineering targets
 
 1. **Router / f16 matvec A/B**
-   - `matmul_f16_ordered_chunks_kernel` is a major decode-only Nsight bucket.
-   - First run environment-level A/B for f16 router and pair-matmul paths.
-   - Only write a specialized router kernel if the A/B shows this path has real upside.
+   - `matmul_f16_kernel` is now the largest decode-focused Nsight bucket on current `main`.
+   - cuBLAS-style replacement is fast but numerically risky; prefer exactness-preserving custom-kernel changes or very narrow shape-specific A/B.
+   - Only promote a specialized f16 path after repeated long-context or logprob validation, because small numerical changes can alter the generated answer.
 
 2. **Attention/indexer replacement, not fallback toggles**
    - Built-in fallback toggles did not improve generation at `ctx=32768`.
