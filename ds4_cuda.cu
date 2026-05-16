@@ -1594,6 +1594,49 @@ __global__ static void matmul_f16_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+__global__ static void matmul_f16_syncwarp_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    float sum = 0.0f;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += __half2float(wr[i]) * xr[i];
+    }
+
+    __shared__ float partial[256];
+    const uint32_t tid = threadIdx.x;
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 32u; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid < 32u) {
+        partial[tid] += partial[tid + 32u];
+        __syncwarp();
+        partial[tid] += partial[tid + 16u];
+        __syncwarp();
+        partial[tid] += partial[tid + 8u];
+        __syncwarp();
+        partial[tid] += partial[tid + 4u];
+        __syncwarp();
+        partial[tid] += partial[tid + 2u];
+        __syncwarp();
+        partial[tid] += partial[tid + 1u];
+        __syncwarp();
+        if (tid == 0) out[tok * out_dim + row] = partial[0];
+    }
+}
+
 __global__ static void matmul_f16_serial_kernel(
         float *out,
         const __half *w,
@@ -5985,6 +6028,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
     const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+    const int syncwarp_f16 = getenv("DS4_CUDA_F16_SYNCWARP_REDUCE") != NULL;
     const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
     const int serial_router =
         !serial_f16 &&
@@ -6032,6 +6076,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     if (ordered_one_token) {
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
+    }
+    if (syncwarp_f16) {
+        matmul_f16_syncwarp_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_syncwarp launch");
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
