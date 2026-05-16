@@ -153,6 +153,11 @@ Validation status for `5347041`:
 - `codex/indexed-attn-direct-topk-decode-ab`: bypassed the generic indexed-attention kernel's top-k filtering/atomic staging when all compressed rows appeared visible, via `DS4_CUDA_INDEXED_DIRECT_TOPK_DECODE=1`. Smoke passed, but generation slowed sharply; run `~/ds4/codex-runs/20260516-034121-indexed-direct-topk-decode-ab`:
   - `ctx=4096`, 3 runs: baseline 45.50 gen t/s, candidate 39.74 gen t/s.
   - Interpretation: the decode top-k filtering path is not safe to bypass with this simple visibility check. The attention cache count and indexer-selected rows should not be assumed interchangeable without a stronger invariant/proof.
+- Existing f16/router policy switches on current `main`, run `~/ds4/codex-runs/20260516-034729-f16-policy-ab`:
+  - Baseline: 45.82 gen t/s at `ctx=4096`, 256 generated tokens.
+  - `DS4_CUDA_USE_ORDERED_F16_MATMUL=1`: 43.68 gen t/s; old ordered one-token path remains slower on Blackwell.
+  - `DS4_CUDA_NO_F16_PAIR_MATMUL=1`: 45.71 gen t/s; no useful gain from disabling paired f16 matmul.
+  - `DS4_CUDA_SERIAL_ROUTER=1`: 31.13 gen t/s; serial router is a clear slow fallback.
 
 Operational note: future fallback-disabling probes should use shorter generation counts first. Slow fallback checks are useful negative results, but they should not occupy the GPU for long unless the early result shows a plausible gain.
 
@@ -203,8 +208,8 @@ This points to general decode kernel fragmentation plus real q8/MoE/matvec kerne
 
 1. **Router / f16 matvec A/B**
    - `matmul_f16_ordered_chunks_kernel` is a major decode-only Nsight bucket.
-   - First run environment-level A/B for f16 router and pair-matmul paths.
-   - Only write a specialized router kernel if the A/B shows this path has real upside.
+   - Existing f16/router environment switches did not improve generation.
+   - Only write a specialized f16/router kernel if it preserves correctness and attacks the current generic `matmul_f16_kernel` cost directly.
 
 2. **Attention/indexer replacement, not fallback toggles**
    - Built-in fallback toggles did not improve generation at `ctx=32768`.
