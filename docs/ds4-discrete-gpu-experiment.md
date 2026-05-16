@@ -207,6 +207,7 @@ This points to general decode kernel fragmentation plus real q8/MoE/matvec kerne
    - `matmul_f16_kernel` is now the largest decode-focused Nsight bucket on current `main`.
    - cuBLAS-style replacement is fast but numerically risky; prefer exactness-preserving custom-kernel changes or very narrow shape-specific A/B.
    - Only promote a specialized f16 path after repeated long-context or logprob validation, because small numerical changes can alter the generated answer.
+   - Rejected micro-optimization: branch `codex/f16-syncwarp-reduce-ab`, run `~/ds4/codex-runs/20260516-031526-f16-syncwarp-ab`, replaced late block-wide f16 reduction barriers with warp-level sync under `DS4_CUDA_F16_SYNCWARP_REDUCE=1`. Smoke passed, but speed was noise-level: `ctx=64` averaged 56.75 base vs 56.81 syncwarp; `ctx=4096` averaged 45.76 vs 45.76. Do not merge.
 
 2. **Attention/indexer replacement, not fallback toggles**
    - Built-in fallback toggles did not improve generation at `ctx=32768`.
