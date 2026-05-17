@@ -55,7 +55,17 @@ Command:
   --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128
 ```
 
-Current correctness-safe baseline is the upstream-shaped sweep with the Blackwell generic f16 default patch:
+Post-upstream-sync default-policy baseline. This uses the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
+
+- Run: `~/ds4/codex-runs/20260517-043821-sync-baseline`
+- Worktree: `~/ds4/codex-worktrees/20260517-043821-sync-baseline`
+- CSV: `~/ds4/codex-runs/20260517-043821-sync-baseline/bench-sync-default.csv`
+- `ctx=2048`: 364.03 prefill t/s, 46.74 gen t/s
+- `ctx=32768`: 339.78 prefill t/s, 40.69 gen t/s
+
+This is the current safer speed reference for generation because it avoids the low-reserve q8 f16 cache policy while the Alice long-context correctness issue is open. Prefill is much lower than the low-reserve policy numbers for exactly that reason.
+
+Previous upstream-shaped sweep with the Blackwell generic f16 default patch and higher q8 f16 cache reuse:
 
 - Run: `~/ds4/codex-runs/20260515-003703-f16-default-official-sweep`
 - CSV: `speed-bench/rtx_pro_6000_f16_default_official_65536_20260515.csv`
@@ -248,7 +258,14 @@ Long-context stability follow-up:
   - Bench after code revert: `341.62` prefill t/s, `38.61` gen t/s at `ctx=32768`, 512 generated tokens.
 - Current interpretation: low-reserve q8 f16 caching is definitely not deployable, but the Alice long-context check is also marginal on the CUDA path. Do not promote `DS4_CUDA_NO_Q8_F16_CACHE=1` or a code revert as a fix. Next correctness work should capture the generated long-context output/logit divergence around the Alice fact, not keep toggling cache policy blindly.
 
-Upstream status as of 2026-05-14: upstream has new server/API commits plus `04b6fda` (`cuda: use managed KV cache for huge contexts`). That CUDA change is scoped to very large KV caches and should not affect the current 32k/65k benchmark phase. Treat it as a separate long-context stability item, not as part of the RTX Pro 6000 throughput work, and verify carefully before merging because managed KV can trade performance for allocation survivability.
+Upstream status as of 2026-05-17: fork `main` was rebased onto upstream `ef0a490` and force-pushed to `origin/main`.
+
+Interesting upstream changes from the sync:
+
+- `04b6fda` (`cuda: use managed KV cache for huge contexts`) is scoped to very large KV/context allocations and logs when active. It should not affect the current 32k/65k benchmark phase. Treat it as a separate long-context stability item because managed KV can trade performance for allocation survivability.
+- `ds4-eval` received benchmark/reporting/control improvements and new COMPSEC eval cases. This is useful for correctness instrumentation around the Alice long-context failure.
+- Server/runtime work landed around CORS, cache reporting, working-directory control, tool/reasoning replay, and min-p default sampling. Useful for deployment polish, not raw RTX decode throughput.
+- No upstream commit in this sync appears to implement CUDA Graph replay or a major RTX Pro 6000 decode-throughput fix.
 
 At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. At `ctx=32768`, the Blackwell f16 default patch reaches 40.74 t/s versus the upstream DGX Spark row at 13.75 t/s: about 3.0x, still below the broad 4x compute-ratio target band.
 
@@ -397,9 +414,15 @@ Token-byte parity vs the official DeepSeek V4 Flash API remains the hard gate. E
 make test CUDA_ARCH=sm_120
 ```
 
+Known synced-main CUDA failure shape from `~/ds4/codex-runs/20260517-043821-sync-baseline`:
+
+- `long-context`: wrong assignment for Alice, got `50` expected `52`.
+- `logprob-vectors`: `long_memory_archive` selected-token mismatches and official-top-token-missing checks.
+- `tool-call-quality`, `metal-kernels`, and `server` passed in that run.
+
 For now, a candidate patch is acceptable only if:
 
 - It builds for `CUDA_ARCH=sm_120`.
 - Smoke generation works.
-- `make test CUDA_ARCH=sm_120` does not introduce a new failure shape beyond the known `long_memory_archive` logprob-vector failures.
+- `make test CUDA_ARCH=sm_120` does not introduce a new failure shape beyond the known Alice long-context failure and `long_memory_archive` logprob-vector failures.
 - A/B decode benchmarks show a repeatable gain, not a single lucky run.
