@@ -268,6 +268,35 @@ static void test_long_debug_output_file(const char *text) {
     fprintf(stderr, "ds4-test: wrote long-context output to %s\n", path);
 }
 
+static void test_long_debug_print_token_text(ds4_engine *engine, int token) {
+    size_t len = 0;
+    char *text = ds4_token_text(engine, token, &len);
+    if (!text) return;
+    fputc('"', stderr);
+    test_print_text_span(stderr, text, text + len);
+    fputc('"', stderr);
+    free(text);
+}
+
+static void test_long_debug_token_trace(ds4_engine *engine, ds4_session *session,
+                                        int step, int selected) {
+    if (!test_env_enabled("DS4_TEST_LONG_TOKEN_TRACE")) return;
+
+    ds4_token_score scores[8];
+    int nscore = ds4_session_top_logprobs(session, scores, 8);
+    fprintf(stderr, "ds4-test: long-context token step=%d selected=%d text=",
+            step, selected);
+    test_long_debug_print_token_text(engine, selected);
+    fprintf(stderr, " top=");
+    for (int i = 0; i < nscore; i++) {
+        if (scores[i].id < 0) continue;
+        fprintf(stderr, "%s%d:", i ? "," : "", scores[i].id);
+        test_long_debug_print_token_text(engine, scores[i].id);
+        fprintf(stderr, "/%.6g", scores[i].logit);
+    }
+    fputc('\n', stderr);
+}
+
 static bool test_output_has_fact(const char *text, const test_long_fact *fact) {
     const size_t name_len = strlen(fact->name);
     const char *p = text;
@@ -380,6 +409,7 @@ static void test_long_story_fact_recall(void) {
     bool decode_ok = true;
     for (; generated < 350; generated++) {
         int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        test_long_debug_token_trace(engine, session, generated, token);
         if (token == ds4_token_eos(engine)) break;
 
         size_t piece_len = 0;
