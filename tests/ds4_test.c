@@ -223,6 +223,51 @@ static bool test_parse_assignment_value(const char *p, int *value) {
     return true;
 }
 
+static bool test_env_enabled(const char *name) {
+    const char *v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+static void test_print_text_span(FILE *fp, const char *start, const char *end) {
+    for (const char *p = start; p < end && *p; p++) {
+        if (*p == '\n' || *p == '\r') fputc(' ', fp);
+        else fputc(*p, fp);
+    }
+}
+
+static void test_long_debug_name_context(const char *text, const char *name) {
+    if (!test_env_enabled("DS4_TEST_LONG_DEBUG")) return;
+
+    const size_t name_len = strlen(name);
+    const char *p = text;
+    int shown = 0;
+    while ((p = strstr(p, name)) != NULL && shown < 8) {
+        const char *start = p;
+        const char *end = p + name_len;
+        for (int i = 0; i < 96 && start > text; i++) start--;
+        for (int i = 0; i < 160 && *end; i++) end++;
+        fprintf(stderr, "ds4-test: long-context debug %s context[%d]: ", name, shown);
+        test_print_text_span(stderr, start, end);
+        fputc('\n', stderr);
+        p += name_len;
+        shown++;
+    }
+}
+
+static void test_long_debug_output_file(const char *text) {
+    const char *path = getenv("DS4_TEST_LONG_OUTPUT_FILE");
+    if (!path || !path[0]) return;
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-test: could not write DS4_TEST_LONG_OUTPUT_FILE=%s\n", path);
+        return;
+    }
+    fwrite(text, 1, strlen(text), fp);
+    fclose(fp);
+    fprintf(stderr, "ds4-test: wrote long-context output to %s\n", path);
+}
+
 static bool test_output_has_fact(const char *text, const test_long_fact *fact) {
     const size_t name_len = strlen(fact->name);
     const char *p = text;
@@ -255,6 +300,7 @@ static bool test_output_has_fact(const char *text, const test_long_fact *fact) {
                 "ds4-test: long-context missing assignment for %s=%d\n",
                 fact->name, fact->number);
     }
+    test_long_debug_name_context(text, fact->name);
     return false;
 }
 
@@ -348,6 +394,7 @@ static void test_long_story_fact_recall(void) {
     }
 
     const char *text = out.ptr ? out.ptr : "";
+    test_long_debug_output_file(text);
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(generated > 0);
     for (size_t i = 0; i < sizeof(test_long_facts) / sizeof(test_long_facts[0]); i++) {
