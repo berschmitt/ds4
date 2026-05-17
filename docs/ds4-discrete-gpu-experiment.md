@@ -26,13 +26,14 @@ Correctness-safe default for this 96 GB discrete card:
 
 ```bash
 # Do not set DS4_CUDA_Q8_F16_CACHE_RESERVE_MB for correctness-gated runs.
-# Do not use the old 128 MB reserve policy as a default.
+# Use low-reserve q8->f16 cache tuning only as an explicit per-run benchmark knob.
 ```
 
 Why:
 
 - `./ds4_test --long-context` passes with the default q8->f16 cache reserve.
-- Lowering `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` improves prefill in short benchmarks, but it breaks the long-context correctness gate.
+- After rebasing onto upstream `c9dd949`, `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` also passes `./ds4_test --long-context`.
+- However, low reserves are still not clean enough for a global runtime policy: `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 make test CUDA_ARCH=sm_120` OOMs during `logprob-vectors`, while `512` MB changes the logprob-vector failure shape.
 - `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1` is not useful as a default when the reserve is left alone, because the q8->f16 cache is already budget-exhausted before it can populate.
 - On Blackwell CUDA (`sm_12x`), one-token f16 matvecs now default to the generic 256-thread path. Set `DS4_CUDA_USE_ORDERED_F16_MATMUL=1` to restore the old ordered 32-thread path for A/B.
 
@@ -41,7 +42,7 @@ Canonical reference CSVs live in `speed-bench/`:
 - `rtx_pro_6000_default_reserve.csv`
 - `rtx_pro_6000_reserve_512mb.csv`
 - `rtx_pro_6000_reserve_128mb.csv`
-- `rtx_pro_6000.csv` - historical low-reserve policy baseline, not correctness-safe
+- `rtx_pro_6000.csv` - historical low-reserve policy baseline; useful for prefill comparison, not a global default
 - `rtx_pro_6000_official_65536_20260514.csv` - upstream-shaped `ctx=2048..65536` sweep on current `main`
 - `rtx_pro_6000_f16_default_official_65536_20260515.csv` - upstream-shaped sweep with the Blackwell generic f16 default patch
 
@@ -63,7 +64,7 @@ Post-upstream-sync default-policy baseline. This uses the synced fork at `89f3a0
 - `ctx=2048`: 364.03 prefill t/s, 46.74 gen t/s
 - `ctx=32768`: 339.78 prefill t/s, 40.69 gen t/s
 
-This is the current safer speed reference for generation because it avoids the low-reserve q8 f16 cache policy while the Alice long-context correctness issue is open. Prefill is much lower than the low-reserve policy numbers for exactly that reason.
+This remains the safer full-test reference because it avoids the low-reserve q8 f16 cache policy. After the `c9dd949` sync, the Alice long-context issue is no longer open, but low-reserve settings still change the `logprob-vectors` failure shape or hit CUDA OOM.
 
 Previous upstream-shaped sweep with the Blackwell generic f16 default patch and higher q8 f16 cache reuse:
 
@@ -73,7 +74,7 @@ Previous upstream-shaped sweep with the Blackwell generic f16 default patch and 
 - `ctx=32768`: 459.76 prefill t/s, 40.74 gen t/s
 - `ctx=65536`: 437.33 prefill t/s, 37.88 gen t/s
 
-Historical low-reserve baseline, before the small decode Q norm+RoPE fusion. Keep this only as a performance artifact; it is not correctness-safe:
+Historical low-reserve baseline, before the small decode Q norm+RoPE fusion. Keep this as a performance artifact and per-run tuning reference, not as a global policy:
 
 - `ctx=2048`: 541.33 prefill t/s, 43.25 gen t/s
 - `ctx=4096`: 528.38 prefill t/s, 42.47 gen t/s
@@ -229,7 +230,7 @@ Fallback audit at `ctx=32768`:
 - Run: `~/ds4/codex-runs/20260515-040252-fallback-audit`
 - Result: `506.31` prefill t/s, `40.76` gen t/s.
 - Filtered stderr showed no hard CUDA allocation failures. The recurring fallback was q8 f16 cache budget exhaustion only: 1056 budget messages after 192 q8 f16 cache entries and full model tensor-span caching.
-- Conclusion: upstream's allocation-fallback hypothesis is directionally plausible for q8 f16 cache pressure, but current RTX Pro 6000 evidence does not show an unknown buffer allocation failure path. The attempted reserve reduction improved prefill but broke correctness.
+- Conclusion from this pre-`c9dd949` run: upstream's allocation-fallback hypothesis was directionally plausible for q8 f16 cache pressure, but the evidence did not show an unknown buffer allocation failure path. Later upstream fixes changed the long-context result, but low-reserve settings still need full-test validation.
 
 Reserve correctness boundary:
 
@@ -239,7 +240,7 @@ Reserve correctness boundary:
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=3072`: failed the same way.
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=2816`: failed after q8 f16 cache reached about `0.14 GiB`.
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=2560`, `2048`, and `128`: all failed the same way.
-- Conclusion: do not set `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` for correctness-gated runs. Treat all low-reserve speed CSVs as historical performance probes, not deployable policy.
+- Conclusion from this pre-`c9dd949` boundary run: do not set `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` for correctness-gated runs. After the later upstream sync, 128 MB passes `long-context`, but full `make test` still shows that low reserves are not deployable as global policy.
 
 Long-context stability follow-up:
 
@@ -256,7 +257,7 @@ Long-context stability follow-up:
 - Run: `~/ds4/codex-runs/20260515-055915-f16-code-revert-validate`
   - Reverting only the `ds4_cuda.cu` code delta from `a486c90` gave a mixed result: pass, fail, then generic opt-in pass.
   - Bench after code revert: `341.62` prefill t/s, `38.61` gen t/s at `ctx=32768`, 512 generated tokens.
-- Current interpretation: low-reserve q8 f16 caching is definitely not deployable, but the Alice long-context check is also marginal on the CUDA path. Do not promote `DS4_CUDA_NO_Q8_F16_CACHE=1` or a code revert as a fix. Next correctness work should capture the generated long-context output/logit divergence around the Alice fact, not keep toggling cache policy blindly.
+- Current interpretation after the later `c9dd949` sync: the Alice long-context check was fixed upstream, so these runs are historical evidence rather than the active gate. Do not promote `DS4_CUDA_NO_Q8_F16_CACHE=1` or a code revert as a fix. The active correctness target is now the remaining `logprob-vectors` failure shape.
 - Debug run: `~/ds4/codex-runs/20260517-045021-longctx-debug` using branch `codex/long-context-debug`.
   - Test-only envs: `DS4_TEST_LONG_DEBUG=1` and `DS4_TEST_LONG_OUTPUT_FILE=$RUN_DIR/long-context-output.txt`.
   - Output shape was otherwise correct and compact: `Bob=34`, `Alice=50`, `Clara=71`, ..., `Priya=97`.
@@ -266,14 +267,28 @@ Long-context stability follow-up:
   - This makes the failure look like a small accumulated numeric/path difference that flips a near-tie, not a gross output-format bug.
   - Next useful probe is a CPU/GPU or alternate-kernel logit comparison for that exact prefix/step, not another whole-run cache toggle.
 
-Upstream status as of 2026-05-17: fork `main` was rebased onto upstream `ef0a490` and force-pushed to `origin/main`.
+Upstream status as of 2026-05-17: fork `main` was rebased onto upstream `c9dd949` and force-pushed to `origin/main`.
 
 Interesting upstream changes from the sync:
 
+- `5bc1e6d` (`Apply Flash graph correctness fixes`) partially merges official DeepSeek V4 Flash graph fixes: shared expert SwiGLU limit clamp, ratio-4 indexer Hadamard rotation, and FP4 activation-simulation round trips before top-k scoring. This is directly relevant to CUDA correctness.
+- `c9dd949` (`cuda: fix compressed prefill RoPE positions`) fixes compressed prefill/replay RoPE positions with `pos0 + t * ratio`. This was the most likely fix for the Alice long-context near-tie/wrong-assignment behavior.
 - `04b6fda` (`cuda: use managed KV cache for huge contexts`) is scoped to very large KV/context allocations and logs when active. It should not affect the current 32k/65k benchmark phase. Treat it as a separate long-context stability item because managed KV can trade performance for allocation survivability.
 - `ds4-eval` received benchmark/reporting/control improvements and new COMPSEC eval cases. This is useful for correctness instrumentation around the Alice long-context failure.
 - Server/runtime work landed around CORS, cache reporting, working-directory control, tool/reasoning replay, and min-p default sampling. Useful for deployment polish, not raw RTX decode throughput.
 - No upstream commit in this sync appears to implement CUDA Graph replay or a major RTX Pro 6000 decode-throughput fix.
+
+Post-sync verification on the RTX Pro 6000 host:
+
+- Run directory: `~/ds4/codex-runs/20260517-upstream-sync`
+- Fresh worktree: `~/ds4/codex-worktrees/upstream-sync-20260517-184936`
+- `make cuda CUDA_ARCH=sm_120 -j$(nproc)`: OK
+- `./ds4_test --long-context`: OK with the default reserve.
+- `make test CUDA_ARCH=sm_120`: still fails in `logprob-vectors / long_memory_archive` with 7 assertion failures; `long-context`, `tool-call-quality`, `metal-kernels`, and `server` pass.
+- `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 ./ds4_test --long-context`: OK.
+- `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 make test CUDA_ARCH=sm_120`: fails in `logprob-vectors` with CUDA OOM during session creation (`2` failures). This is a different failure shape from default.
+- `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512 make test CUDA_ARCH=sm_120`: avoids OOM but fails `logprob-vectors / short_code_completion` with `1` selected-token mismatch. This is also a different failure shape from default.
+- Smoke bench with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `ctx=4096`, `gen_tokens=256`: `534.17` prefill t/s, `45.82` gen t/s.
 
 At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. At `ctx=32768`, the Blackwell f16 default patch reaches 40.74 t/s versus the upstream DGX Spark row at 13.75 t/s: about 3.0x, still below the broad 4x compute-ratio target band.
 
@@ -365,10 +380,10 @@ This points to general decode kernel fragmentation plus real q8/MoE/matvec kerne
 
 Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream benchmark shape first, then re-check longer contexts. Do not spend time on changes that only move short-prompt smoke tests.
 
-1. **Long-context exactness probe**
-   - The Alice wrong-assignment failure is now the gating issue for both prefill-cache recovery and decode speed patches.
-   - Stop treating `./ds4_test --long-context` as only a pass/fail gate. Add or use instrumentation that captures the generated text/logit path around the Alice fact so we can identify where the CUDA path diverges.
-   - Until this is understood, do not promote low-reserve q8 f16 cache policy or top-k shortcuts as correctness-safe.
+1. **Logprob-vector parity probe**
+   - The Alice long-context failure is resolved on the post-`c9dd949` sync, but `make test CUDA_ARCH=sm_120` still fails `logprob-vectors / long_memory_archive` under the default reserve.
+   - Low-reserve q8 f16 cache settings now pass `./ds4_test --long-context`, but they change the full-test failure shape (`128` MB OOMs in logprob vectors; `512` MB flips a `short_code_completion` token).
+   - Next correctness work should instrument the logprob-vector cases, especially cache/no-cache and tensor-label differences, rather than continuing to use Alice as the primary gate.
 
 2. **CUDA Graph replay feasibility**
    - LnaLang4U reports a large CUDA Graphs ON/OFF gap on RTX Pro 6000-class hardware, and DS4 still launches many small decode kernels per token.
@@ -387,15 +402,15 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Maintain the target bands: below 50 t/s is not enough; 55-65 t/s is the first acceptable generation band; 70-80 t/s is the strong target.
 
 4. **Selective q8 f16 cache recovery**
-   - Prefill is important, and the low-reserve policy showed the upside. The problem is exactness, not lack of speed.
-   - After the exactness probe exists, re-test q8 f16 caching by tensor group/label rather than blunt reserve size.
-   - Goal: recover safe prefill wins while preserving the Alice long-context behavior.
+   - Prefill is important, and the low-reserve policy showed the upside. The problem is full-test behavior and VRAM headroom, not the old Alice long-context output.
+   - Re-test q8 f16 caching by tensor group/label rather than blunt reserve size. The current blunt `128` MB policy is good for benchmark prefill but too aggressive for global use.
+   - Goal: recover safe prefill wins while preserving the default logprob-vector failure shape, with no OOMs.
 
 5. **Indexed attention / indexer redesign**
    - Highest combined decode target after the patched Nsight profile: indexed attention, dense attention, top-k chunk/merge, and indexer score/direct kernels.
    - Built-in fallback toggles and single-token grouped-head routing did not help.
-   - Three top-k sorter shortcuts produced real speed signals, but their long-context failures may have been contaminated by the now-invalid low-reserve policy.
-   - Next useful work here is a correctness-preserving harness under the default reserve. First prove the harness is a no-op by passing `./ds4_test --long-context` with no fast-path env var, then compare selected index/order behavior against the current chunked path before accepting any top-k or attention-gather speedup.
+   - Three top-k sorter shortcuts produced real speed signals, but earlier long-context failures were likely contaminated by now-fixed upstream correctness issues and/or low-reserve cache policy.
+   - Next useful work here is a correctness-preserving harness under the default reserve. First prove the harness is a no-op by preserving the current `make test` failure shape, then compare selected index/order behavior against the current chunked path before accepting any top-k or attention-gather speedup.
 
 6. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.
@@ -405,10 +420,10 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
 7. **q8 decode matvec path**
    - Multiple q8 buckets together are material, and the fp16 cache budget issue is not safely mitigated by reserve tuning.
    - First concrete task: split q8 decode time by call shape/label if needed, then target the largest repeated decode-only shapes.
-   - Avoid chasing more q8->fp16 cache policy unless the exactness issue is understood; low reserve values currently fail `./ds4_test --long-context`.
+   - Avoid chasing more q8->fp16 cache policy unless the exactness issue is understood; low reserve values now pass `long-context` after `c9dd949`, but they still perturb full `logprob-vectors` behavior.
 
 8. **Huge-context stability and disk-KV pass**
-   - Defer until upstream-benchmark generation speed and the Alice exactness issue are better understood.
+   - Defer until upstream-benchmark generation speed and the remaining logprob-vector exactness issue are better understood.
    - Revisit upstream managed-KV-cache changes separately; they may help huge contexts but can trade off discrete-GPU performance.
    - If KV offload becomes necessary for maximum context, measure the MP700 PRO XT path before considering Optane.
 
@@ -422,15 +437,17 @@ Token-byte parity vs the official DeepSeek V4 Flash API remains the hard gate. E
 make test CUDA_ARCH=sm_120
 ```
 
-Known synced-main CUDA failure shape from `~/ds4/codex-runs/20260517-043821-sync-baseline`:
+Known synced-main CUDA failure shape from `~/ds4/codex-runs/20260517-upstream-sync` after rebasing onto upstream `c9dd949`:
 
-- `long-context`: wrong assignment for Alice, got `50` expected `52`.
-- `logprob-vectors`: `long_memory_archive` selected-token mismatches and official-top-token-missing checks.
-- `tool-call-quality`, `metal-kernels`, and `server` passed in that run.
+- `long-context`: OK.
+- `logprob-vectors`: `long_memory_archive` selected-token mismatches and official-top-token-missing checks, `7` assertion failures total.
+- `tool-call-quality`, `metal-kernels`, and `server`: OK.
+- `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`: `long-context` OK, but full `make test` OOMs during `logprob-vectors`.
+- `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512`: avoids OOM, but changes the logprob-vector failure shape to a `short_code_completion` selected-token mismatch.
 
 For now, a candidate patch is acceptable only if:
 
 - It builds for `CUDA_ARCH=sm_120`.
 - Smoke generation works.
-- `make test CUDA_ARCH=sm_120` does not introduce a new failure shape beyond the known Alice long-context failure and `long_memory_archive` logprob-vector failures.
+- `make test CUDA_ARCH=sm_120` does not introduce a new failure shape beyond the known default-reserve `long_memory_archive` logprob-vector failures.
 - A/B decode benchmarks show a repeatable gain, not a single lucky run.
