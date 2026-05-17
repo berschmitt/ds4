@@ -350,6 +350,11 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Do not assume DS4 can get the same gain as SGLang/PyTorch: DS4 is native C/CUDA and already avoids a lot of framework overhead.
    - First step: make a minimal decode capture/replay feasibility probe for a fixed benchmark shape, or prove exactly which token-varying state prevents capture.
    - Success criterion is practical: a repeatable generation gain at `ctx=32768`, not a synthetic launch-count reduction.
+   - Probe run: `~/ds4/codex-runs/20260516-042711-cuda-graph-phase-probe`.
+   - Single reusable `cudaGraphExec` failed quickly in earlier testing. A slot cache with 4 or 8 phase slots replayed 127 tokens, then failed on token 128.
+   - A 128-slot update cache completed `ctx=4096, gen=256`: `instantiated=128 updated=128 launched=256 failed=0`.
+   - It is not a speed patch as written: same-length control was 46.18 tok/s, while the 128-slot capture/update probe was 42.00 tok/s because it still captures/updates every token.
+   - Useful conclusion: CUDA Graph replay remains plausible only with a proper 128-phase graph cache plus direct node parameter updates/static device parameter buffers. The capture/update probe itself should not be merged.
 
 3. **Benchmark calibration against external references**
    - Run or reproduce an apples-to-apples DS4 server benchmark where possible, especially `llama-benchy`-style steady-state `tg`, because DS4's average generation metric and forum/README metrics are not always the same.
