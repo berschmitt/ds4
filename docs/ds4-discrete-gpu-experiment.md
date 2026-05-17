@@ -328,7 +328,7 @@ Post-sync verification on the RTX Pro 6000 host:
 - Smoke bench with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `ctx=4096`, `gen_tokens=256`: `534.17` prefill t/s, `45.82` gen t/s.
 - Minimal upstream-facing repro note: `docs/upstream-logprob-vector-repro.md`.
 
-At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. At `ctx=32768`, the current post-`c9dd949` default-reserve sweep reaches 40.61 t/s versus the upstream DGX Spark row at 13.75 t/s: about 3.0x, still below the broad 4x compute-ratio target band.
+At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. After the adopted top-k 8704 patch, `ctx=32768` reaches about 42.6-42.8 generation t/s versus the upstream DGX Spark row at 13.75 t/s: about 3.1x, still below the broad 4x compute-ratio target band.
 
 ## Upstream PR watchlist
 
