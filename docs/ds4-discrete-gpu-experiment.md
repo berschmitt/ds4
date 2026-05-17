@@ -261,7 +261,10 @@ Long-context stability follow-up:
   - Test-only envs: `DS4_TEST_LONG_DEBUG=1` and `DS4_TEST_LONG_OUTPUT_FILE=$RUN_DIR/long-context-output.txt`.
   - Output shape was otherwise correct and compact: `Bob=34`, `Alice=50`, `Clara=71`, ..., `Priya=97`.
   - This narrows the Alice failure: the format and all other assignments are correct, but Alice's value is decoded as `50` instead of `52`.
-  - Next useful probe is a token/logit comparison around the exact generation step for Alice's numeric value, not another whole-run cache toggle.
+- Token trace run: `~/ds4/codex-runs/20260517-045637-longctx-token-trace` using `DS4_TEST_LONG_TOKEN_TRACE=1`.
+  - At generation step 7, immediately after `Alice=`, the top logits were near-tied: token `50` at `40.2729`, token `52` at `40.0574`.
+  - This makes the failure look like a small accumulated numeric/path difference that flips a near-tie, not a gross output-format bug.
+  - Next useful probe is a CPU/GPU or alternate-kernel logit comparison for that exact prefix/step, not another whole-run cache toggle.
 
 Upstream status as of 2026-05-17: fork `main` was rebased onto upstream `ef0a490` and force-pushed to `origin/main`.
 
