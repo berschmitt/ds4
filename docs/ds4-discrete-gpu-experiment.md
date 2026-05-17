@@ -335,7 +335,7 @@ At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Sp
 As of 2026-05-15, upstream has many open PRs. Relevant ones for this fork:
 
 - [#121 cuda: skip ordered f16 matmul on Blackwell](https://github.com/antirez/ds4/pull/121): aligns with our independently validated Blackwell f16 default patch. Track for upstream merge/rebase cleanup.
-- [#145 cuda: add launch-bounded tile8 MoE down path](https://github.com/antirez/ds4/pull/145): opt-in `DS4_CUDA_MOE_DOWN_TILE8_ROWSPAN` path layered on #121. Worth a quick RTX Pro 6000 A/B because it targets a real decode bucket, but only keep if it moves `ctx=32768`, 512-token generation by a repeatable margin.
+- [#145 cuda: add launch-bounded tile8 MoE down path](https://github.com/antirez/ds4/pull/145): opt-in `DS4_CUDA_MOE_DOWN_TILE8_ROWSPAN` path layered on #121. Static inspection shows this is gated through the atomic tiled down route (`use_atomic_down`, normally prefill/batch) while single-token decode uses the direct `sum6` down path. Treat this as a possible prefill/batch throughput idea, not a primary generation-speed target.
 - [#153 cuda: add direct-model partial weight cache](https://github.com/antirez/ds4/pull/153): important for 24 GB direct-model users. Not a primary RTX Pro 6000 target because our card can hold the full 80.76 GiB model image in VRAM, but the dense-weight prioritization is useful background for future cache policy thinking.
 - [#158 cuda: fix HMM path on coherent unified-memory systems](https://github.com/antirez/ds4/pull/158): GB10 / coherent unified-memory path, not a discrete RTX Pro 6000 path. Track only to avoid accidentally importing unified-memory assumptions.
 - [#159 fix(kv-cache): guard never-hit entries from immediate self-eviction](https://github.com/antirez/ds4/pull/159) and [#134 Guard KV cache against page-cache pressure](https://github.com/antirez/ds4/pull/134): server disk-KV cache robustness. Useful for long-running agent use, not decode throughput.
@@ -452,7 +452,8 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
 
 6. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.
-   - First concrete task: inspect current fused MoE helpers and their launch count before writing new kernels.
+   - PR #145's tile8 down rowspan path is not a decode target because one-token decode takes the direct `sum6` down route.
+   - First concrete task: inspect current decode-specific MoE gate/up and direct-down helpers before writing new kernels.
    - Keep only changes that improve `ctx=32768`, 512-token generation by a repeatable margin.
 
 7. **q8 decode matvec path**
