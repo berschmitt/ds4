@@ -344,18 +344,23 @@ Puts the q2-imatrix GGUF (~81 GB) under `./gguf/` and symlinks `./ds4flash.gguf`
 ./ds4 -p "Say hi in three words." --nothink -n 8 --ctx 4096
 ```
 
-`ds4_test --all` must pass token-byte parity vs the official DeepSeek V4 Flash API logprob vectors. The smoke generation should produce a coherent reply with no crashes — bare metal removes the WSL2 wedge risk we saw earlier.
+`ds4_test --all` is the token-byte parity goal vs the official DeepSeek V4 Flash API logprob vectors. Current CUDA synced-main still has known `logprob-vectors` failures tracked in `docs/ds4-discrete-gpu-experiment.md`; do not treat a performance patch as acceptable if it introduces a new failure shape. The smoke generation should produce a coherent reply with no crashes — bare metal removes the WSL2 wedge risk we saw earlier.
 
 ### Performance tuning
 
-**Tune the q8 fp16 cache for a free prefill speedup.** Default reserve is `max(4 GiB, 5% of VRAM)` = ~4.75 GiB on this 96 GB card, which is too conservative — leaves the fp16 dequant cache empty even when there's spare VRAM, so q8 weights re-dequantize per access during prefill. Set the reserve to 128 MB and keep large attention-output projections out of the q8 fp16 cache:
+**Tune the q8 fp16 cache as a per-run prefill speedup, not as a global shell default yet.** Default reserve is `max(4 GiB, 5% of VRAM)` = ~4.75 GiB on this 96 GB card, which is too conservative for prefill because it leaves the fp16 dequant cache empty even when there is spare VRAM. For benchmark/inference experiments, set the reserve to 128 MB and keep large attention-output projections out of the q8 fp16 cache:
 
 ```sh
-export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128
-export DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1
+DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 \
+DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1 \
+./ds4-bench -m ds4flash.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128
 ```
 
-Add both to `~/.bashrc` (above the interactive guard, same pattern as CUDA PATH) for persistence. The canonical full ctx sweep now uses this pair of overrides:
+Do **not** add these to `~/.bashrc` yet. After the 2026-05-17 upstream sync, `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` passes `./ds4_test --long-context`, but full `make test CUDA_ARCH=sm_120` hits CUDA OOM during `logprob-vectors`. A 512 MB reserve avoids the OOM but changes the logprob-vector failure shape. Keep this as an explicit per-run performance knob until the q8->fp16 cache numerics and memory headroom are better understood.
+
+The canonical full ctx sweep used this pair of overrides:
 
 | ctx | Default reserve | Reserve = 128 MB | + no attn-output cache | Delta vs default |
 |---|---:|---:|---:|---:|
@@ -368,7 +373,7 @@ Reserve sweeps at ctx 8k and ctx 32k showed diminishing returns below 128 MB: `0
 
 Bench CSVs:
 
-- `speed-bench/rtx_pro_6000.csv` — canonical recommended config (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`)
+- `speed-bench/rtx_pro_6000.csv` — low-reserve per-run tuning reference (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`)
 - `speed-bench/rtx_pro_6000_reserve_128mb.csv` — reserve-only run, kept to show the extra gain from excluding attention-output tensors
 - `speed-bench/rtx_pro_6000_default_reserve.csv` — upstream default reserve, kept for before/after reference
 - `speed-bench/rtx_pro_6000_reserve_512mb.csv` — first tuned run, kept to show the diminishing return from 512 MB to 128 MB
