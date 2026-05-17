@@ -355,19 +355,20 @@ DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 \
 DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1 \
 ./ds4-bench -m ds4flash.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128
+  --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128
 ```
 
 Do **not** add these to `~/.bashrc` yet. After the 2026-05-17 upstream sync, `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` passes `./ds4_test --long-context`, but full `make test CUDA_ARCH=sm_120` hits CUDA OOM during `logprob-vectors`. A 512 MB reserve avoids the OOM but changes the logprob-vector failure shape. Keep this as an explicit per-run performance knob until the q8->fp16 cache numerics and memory headroom are better understood.
 
-The canonical full ctx sweep used this pair of overrides:
+The latest post-`c9dd949` full ctx sweep uses `ctx-max=65536`. Larger max context allocates larger context buffers up front, leaving less room for the q8->fp16 cache than the older 32k-max sweeps, so the prefill gain is lower but still material:
 
-| ctx | Default reserve | Reserve = 128 MB | + no attn-output cache | Delta vs default |
-|---|---:|---:|---:|---:|
-| 2k | 370 t/s | 517 t/s | 541 t/s | **+46%** |
-| 8k | 359 t/s | 498 t/s | 522 t/s | **+45%** |
-| 16k | 351 t/s | 488 t/s | 512 t/s | **+46%** |
-| 32k | 342 t/s | 473 t/s | 495 t/s | **+45%** |
+| ctx | Default reserve | 128 MB + no attn-output cache | Delta vs default |
+|---|---:|---:|---:|
+| 2k | 371 t/s | 489 t/s | **+32%** |
+| 8k | 359 t/s | 474 t/s | **+32%** |
+| 16k | 352 t/s | 469 t/s | **+33%** |
+| 32k | 343 t/s | 459 t/s | **+34%** |
+| 65k | 328 t/s | 438 t/s | **+34%** |
 
 Reserve sweeps at ctx 8k and ctx 32k showed diminishing returns below 128 MB: `0` MB adds almost nothing and leaves no safety margin. Temporary cache-miss instrumentation then showed the first eligible tensors were monopolizing the cache: only 137 tensors were cached and misses began around layer 17. Excluding `attn_output_a/b` from the fp16 cache raises cached tensors to 216, drops budget misses from 828 to 168 in the ctx 8k/256-token diagnostic, and adds another ~4.6-4.8% prefill speed. Generation rate is **unchanged** by these knobs (within run-to-run noise) — dmon trace shows generation runs at only ~33% memory-bandwidth utilization, so the bottleneck for gen isn't dequant-related (it's per-kernel launch overhead + CUDA-side synchronization; upstream concern, not fixable by cache reserve tuning alone). Don't set `DS4_CUDA_Q8_F16_ALL=1` — tested, marginally slower than just lowering the reserve.
 
@@ -377,6 +378,8 @@ Bench CSVs:
 - `speed-bench/rtx_pro_6000_reserve_128mb.csv` — reserve-only run, kept to show the extra gain from excluding attention-output tensors
 - `speed-bench/rtx_pro_6000_default_reserve.csv` — upstream default reserve, kept for before/after reference
 - `speed-bench/rtx_pro_6000_reserve_512mb.csv` — first tuned run, kept to show the diminishing return from 512 MB to 128 MB
+- `speed-bench/rtx_pro_6000_post_c9dd949_default_65536_20260517.csv` — current post-sync default-reserve 65k-max sweep
+- `speed-bench/rtx_pro_6000_post_c9dd949_r128_no_attn_output_65536_20260517.csv` — current post-sync tuned 65k-max sweep
 
 **Why the default is conservative**: the formula is `max(4 GiB, total_VRAM/20)`. That makes sense on unified-memory devices (DGX Spark, M-series Macs) where "VRAM" is shared with the OS/page-cache — eating it all would starve the host. On a *discrete* GPU, VRAM is physically isolated; nothing else uses it; the reserve is over-protective. Hence the explicit override.
 

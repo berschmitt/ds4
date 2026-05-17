@@ -53,10 +53,31 @@ Command:
 ```bash
 ./ds4-bench -m ds4flash.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 2048 --ctx-max 32768 --step-incr 2048 --gen-tokens 128
+  --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128
 ```
 
-Post-upstream-sync default-policy baseline. This uses the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
+Current post-`c9dd949` official-shaped sweeps:
+
+- Run: `~/ds4/codex-runs/20260517-post-c9dd949-bench`
+- Worktree: `~/ds4/codex-worktrees/post-c9dd949-bench-20260517-191237`
+- Default CSV: `speed-bench/rtx_pro_6000_post_c9dd949_default_65536_20260517.csv`
+- Tuned CSV: `speed-bench/rtx_pro_6000_post_c9dd949_r128_no_attn_output_65536_20260517.csv`
+
+Default reserve:
+
+- `ctx=2048`: 370.82 prefill t/s, 46.75 gen t/s
+- `ctx=32768`: 342.81 prefill t/s, 40.61 gen t/s
+- `ctx=65536`: 328.06 prefill t/s, 37.74 gen t/s
+
+Per-run tuned reserve (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`):
+
+- `ctx=2048`: 488.87 prefill t/s, 46.58 gen t/s
+- `ctx=32768`: 459.44 prefill t/s, 40.67 gen t/s
+- `ctx=65536`: 438.34 prefill t/s, 37.81 gen t/s
+
+Interpretation: the tuned cache policy still gives about 32-34% prefill gain in the 65k-max benchmark shape, but generation is unchanged. The gain is smaller than older 32k-max sweeps because the larger max context buffer leaves less free VRAM for q8->fp16 cache.
+
+Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
 - Run: `~/ds4/codex-runs/20260517-043821-sync-baseline`
 - Worktree: `~/ds4/codex-worktrees/20260517-043821-sync-baseline`
@@ -288,9 +309,11 @@ Post-sync verification on the RTX Pro 6000 host:
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 ./ds4_test --long-context`: OK.
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 make test CUDA_ARCH=sm_120`: fails in `logprob-vectors` with CUDA OOM during session creation (`2` failures). This is a different failure shape from default.
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512 make test CUDA_ARCH=sm_120`: avoids OOM but fails `logprob-vectors / short_code_completion` with `1` selected-token mismatch. This is also a different failure shape from default.
+- `DS4_CUDA_NO_Q8_F16_CACHE=1 make test CUDA_ARCH=sm_120`: same default `logprob-vectors / long_memory_archive` 7-failure shape. This means the remaining default-reserve parity issue is not solely caused by q8->fp16 cache reuse.
 - Smoke bench with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `ctx=4096`, `gen_tokens=256`: `534.17` prefill t/s, `45.82` gen t/s.
+- Minimal upstream-facing repro note: `docs/upstream-logprob-vector-repro.md`.
 
-At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. At `ctx=32768`, the Blackwell f16 default patch reaches 40.74 t/s versus the upstream DGX Spark row at 13.75 t/s: about 3.0x, still below the broad 4x compute-ratio target band.
+At the official benchmark shape, RTX Pro 6000 is already much faster than DGX Spark in absolute terms, but not in proportion to the hardware delta. At `ctx=32768`, the current post-`c9dd949` default-reserve sweep reaches 40.61 t/s versus the upstream DGX Spark row at 13.75 t/s: about 3.0x, still below the broad 4x compute-ratio target band.
 
 ## Upstream PR watchlist
 
@@ -444,6 +467,7 @@ Known synced-main CUDA failure shape from `~/ds4/codex-runs/20260517-upstream-sy
 - `tool-call-quality`, `metal-kernels`, and `server`: OK.
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`: `long-context` OK, but full `make test` OOMs during `logprob-vectors`.
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512`: avoids OOM, but changes the logprob-vector failure shape to a `short_code_completion` selected-token mismatch.
+- `DS4_CUDA_NO_Q8_F16_CACHE=1`: same default `long_memory_archive` 7-failure shape.
 
 For now, a candidate patch is acceptable only if:
 
