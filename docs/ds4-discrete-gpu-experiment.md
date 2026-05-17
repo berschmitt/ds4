@@ -259,6 +259,10 @@ Operational note: future fallback-disabling probes should use shorter generation
   - Heads4 online route: `498.21` prefill t/s, `34.32` gen t/s.
   - Heads8 online route: `495.48` prefill t/s, `37.84` gen t/s.
   - Conclusion: grouping heads reduces KV reloads but starves single-token decode parallelism. Keep the current per-head indexed attention path unless a new design preserves enough block-level parallelism.
+- Visible top-k direct-copy fast path inside one-token indexed attention, branch `codex/indexed-attn-visible-topk-fastpath`, run `~/ds4/codex-runs/20260517-231626-indexed-attn-visible-ab`: build passed, but generation regressed badly.
+  - Enabled: `37.34`, `37.27` gen t/s.
+  - Disabled with `DS4_CUDA_NO_INDEXED_ATTENTION_VISIBLE_FASTPATH=1`: `42.72`, `42.72` gen t/s.
+  - Conclusion: do not bypass the current shared-memory atomic/filter setup. It likely preserves useful ordering/filter behavior or better scheduling despite looking wasteful.
 
 ## Current diagnosis
 
