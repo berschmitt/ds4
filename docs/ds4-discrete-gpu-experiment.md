@@ -244,6 +244,10 @@ Operational note: future fallback-disabling probes should use shorter generation
 - Postscript on the top-k rejections: `~/ds4/codex-runs/20260515-042542-longctx-env-matrix` showed that `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` fails `./ds4_test --long-context` even without a top-k fast path. Treat earlier top-k long-context failures that used the low-reserve policy as contaminated. The speed signal remains interesting, but it must be revalidated under the correctness-safe default reserve.
 - Temporary 8192+tail comparison harness, run `~/ds4/codex-runs/20260515-045007-topk8192-tail-safe-default` and `~/ds4/codex-runs/20260515-045822-topk-active-correctness-matrix`: not acceptable as a validation harness. It showed zero selected-index mismatches in a `ctx=32768` compare bench, but the patched binary failed `./ds4_test --long-context` even with no top-k env var. Reverted. Any future top-k harness must avoid perturbing the current binary's long-context behavior before it can be trusted.
 - MoE decode half-warp LUT row128 experiment, run `~/ds4/codex-runs/20260515-020046-moe-h16-row128-ab`: build and smoke passed, but generation dropped repeatably at `ctx=32768`, 512 generated tokens (`38.53` / `38.53` gen t/s vs baseline `40.31` / `40.31`). Rejected. Halving the number of gate/up blocks did not compensate for lower per-block efficiency.
+- MoE decode gate/up pair2 experiment, branch `codex/moe-decode-gate-pair2`, run `~/ds4/codex-runs/20260517-232852-moe-gate-pair2-ab`: build passed, but generation regressed.
+  - Pair2: `41.10`, `41.07` gen t/s.
+  - Default: `42.65`, `42.65` gen t/s.
+  - Conclusion: sharing the quantized input/LUT setup across two selected experts loses too much block-level parallelism. Do not carry.
 - q8 decode fallback switches, run `~/ds4/codex-runs/20260515-024932-q8-switch-ab`: all tested switch-offs were worse at `ctx=32768`, 512 generated tokens.
   - Baseline: `512.58` prefill t/s, `40.39` gen t/s.
   - `DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR=1`: `500.76` prefill t/s, `40.10` gen t/s.
