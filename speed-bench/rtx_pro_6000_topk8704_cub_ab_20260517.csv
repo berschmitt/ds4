@@ -1,0 +1,5 @@
+variant,run,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,commit,remote_run_dir
+enabled,1,32768,32768,512.00,512,42.79,475014540,94b6d70,~/ds4/codex-runs/20260517-224346-topk8704-cub-rerun
+disabled,1,32768,32768,500.61,512,40.24,475014540,94b6d70,~/ds4/codex-runs/20260517-224346-topk8704-cub-rerun
+enabled,2,32768,32768,496.67,512,42.68,475014540,94b6d70,~/ds4/codex-runs/20260517-224346-topk8704-cub-rerun
+disabled,2,32768,32768,494.89,512,40.24,475014540,94b6d70,~/ds4/codex-runs/20260517-224346-topk8704-cub-rerun
