@@ -257,6 +257,11 @@ Long-context stability follow-up:
   - Reverting only the `ds4_cuda.cu` code delta from `a486c90` gave a mixed result: pass, fail, then generic opt-in pass.
   - Bench after code revert: `341.62` prefill t/s, `38.61` gen t/s at `ctx=32768`, 512 generated tokens.
 - Current interpretation: low-reserve q8 f16 caching is definitely not deployable, but the Alice long-context check is also marginal on the CUDA path. Do not promote `DS4_CUDA_NO_Q8_F16_CACHE=1` or a code revert as a fix. Next correctness work should capture the generated long-context output/logit divergence around the Alice fact, not keep toggling cache policy blindly.
+- Debug run: `~/ds4/codex-runs/20260517-045021-longctx-debug` using branch `codex/long-context-debug`.
+  - Test-only envs: `DS4_TEST_LONG_DEBUG=1` and `DS4_TEST_LONG_OUTPUT_FILE=$RUN_DIR/long-context-output.txt`.
+  - Output shape was otherwise correct and compact: `Bob=34`, `Alice=50`, `Clara=71`, ..., `Priya=97`.
+  - This narrows the Alice failure: the format and all other assignments are correct, but Alice's value is decoded as `50` instead of `52`.
+  - Next useful probe is a token/logit comparison around the exact generation step for Alice's numeric value, not another whole-run cache toggle.
 
 Upstream status as of 2026-05-17: fork `main` was rebased onto upstream `ef0a490` and force-pushed to `origin/main`.
 
