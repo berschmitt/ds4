@@ -30,10 +30,11 @@ Use these tiers when deciding what belongs on the active fork branch.
 | Half-warp MoE decode LUT (`8258aeb`, `da9a129`) | Candidate | Measured repeatable but modest decode gain. Retest after rebasing onto current upstream before keeping. |
 | Pair decode q/kv q8 matvec (`1d35fbb`) | Drop unless retest shows larger value | Small decode gain, touches shared graph/API surface. Not worth carrying by default. |
 | Decode Q head RMS norm + RoPE fusion (`5347041`) | Drop unless part of a larger fusion plan | Small decode gain, touches shared graph/API surface. Keep result documented, but do not replay automatically. |
+| CUB top-k 8704 fast path (`94b6d70`) | Adopted patch | Post-`c9dd949` retest shows a repeatable `ctx=32768`, 512-token generation gain (`42.79` / `42.68` t/s vs `40.24` / `40.24` disabled), passes `long-context`, and preserves the known default `make test` failure shape. |
 | Low-reserve q8->f16 cache policy (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`) | Per-run benchmark knob only | After upstream `c9dd949`, 128 MB passes `./ds4_test --long-context`, but full `make test` OOMs in `logprob-vectors`; 512 MB avoids OOM but changes the logprob failure shape. Do not install globally yet. |
 | RTX Pro 6000 benchmark CSVs | Keep as historical artifacts | Useful for tracking what happened, but not a runtime policy. |
 | Bare-metal deployment / remote access docs | Keep local | Operationally important for this home-lab host; not intended as upstreamable code. |
-| Rejected top-k/indexer shortcuts | Historical only | Some showed speed signals, but correctness was not proven. Future work needs a non-perturbing comparison harness first. |
+| Broader rejected top-k/indexer shortcuts | Historical only | Narrow `8704` is now adopted after post-`c9dd949` retest. Broader/tail/chunk variants still need a non-perturbing comparison harness before adoption. |
 
 ## Upstream sync workflow
 

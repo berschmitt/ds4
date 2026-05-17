@@ -195,6 +195,21 @@ Validation status for `5347041`:
 - `make test CUDA_ARCH=sm_120` has the same known `logprob-vectors / long_memory_archive` 7-failure pattern seen before this patch; no new failure shape observed.
 - Nsight confirms `head_rms_norm_rope_tail_kernel` is active.
 
+## Adopted RTX Pro 6000 probes
+
+- CUB `top_k=512` fast path for `8192 < n_comp <= 8704`, branch `codex/topk8704-cub-post-c9dd949`, commit `94b6d70`.
+  - Runtime kill switch: `DS4_CUDA_NO_TOPK8704=1`.
+  - Rerun after upstream `c9dd949` in `~/ds4/codex-runs/20260517-224346-topk8704-cub-rerun`.
+  - Built cleanly for `sm_120`.
+  - A/B at `ctx=32768`, 512 generated tokens, with the normal per-run prefill knobs (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`):
+    - Enabled: `42.79`, `42.68` gen t/s.
+    - Disabled with `DS4_CUDA_NO_TOPK8704=1`: `40.24`, `40.24` gen t/s.
+    - Net result: about `+6.1%` generation throughput for the upstream-benchmark context shape.
+  - Correctness gates:
+    - `DS4_TEST_MODEL=$HOME/ds4/ds4flash.gguf ./ds4_test --long-context`: OK with default reserve.
+    - `DS4_TEST_MODEL=$HOME/ds4/ds4flash.gguf make test CUDA_ARCH=sm_120`: same known default-reserve shape as synced main: `logprob-vectors / long_memory_archive`, `7` assertion failures; no new failure shape.
+  - Decision: keep as a small fork patch. The earlier May 15 top-k rejection is now treated as a contaminated historical result because it predated upstream `c9dd949` and overlapped with low-reserve correctness failures.
+
 ## Rejected RTX Pro 6000 probes
 
 - `codex/cuda-end-sync-experiment`: made CUDA command-boundary synchronization optional. No meaningful throughput gain; profiler `cudaDeviceSynchronize` time was mostly waiting for GPU work.
@@ -214,11 +229,11 @@ Operational note: future fallback-disabling probes should use shorter generation
 - Generic paired f16 kernel experiment, run `~/ds4/codex-runs/20260515-005807-f16-pair-generic-ab`: build and smoke passed, but generation was unchanged at `ctx=32768` (`40.34` t/s with pair vs `40.34` without pair). Rejected as extra kernel surface without meaningful decode gain.
 - Single-token indexed attention through grouped heads8 kernel, run `~/ds4/codex-runs/20260515-011513-indexed-heads8-single-ab`: smoke passed, but `ctx=32768` generation dropped (`38.73` t/s patched vs `40.30` t/s old per-head path). Rejected.
 - Env-gated non-indexed decode heads8 single-token route, run `~/ds4/codex-runs/20260515-012123-decode-heads8-single-ab`: `ctx=32768` moved from `40.33` to `40.47` t/s. Too small to justify making default without a larger related attention rewrite.
-- CUB `top_k=512` fast path for `n_comp<=8704`, run `~/ds4/codex-runs/20260515-014029-topk8704-ab`: strong speed signal at `ctx=32768`, 512 generated tokens (`42.85` / `42.73` gen t/s vs `40.31` / `40.30` with `DS4_CUDA_NO_TOPK8704=1`). Rejected because validation changed the correctness shape:
+- Pre-`c9dd949` CUB `top_k=512` fast path for `n_comp<=8704`, run `~/ds4/codex-runs/20260515-014029-topk8704-ab`: strong speed signal at `ctx=32768`, 512 generated tokens (`42.85` / `42.73` gen t/s vs `40.31` / `40.30` with `DS4_CUDA_NO_TOPK8704=1`). Rejected at the time because validation changed the correctness shape:
   - Validation run `~/ds4/codex-runs/20260515-014752-topk8704-validate`: `make test` had 8 failures, adding a new `long-context` wrong-assignment failure.
   - Disable check `~/ds4/codex-runs/20260515-015233-topk8704-longctx-disable-check`: same `long-context` failure even with `DS4_CUDA_NO_TOPK8704=1`.
   - Clean check `~/ds4/codex-runs/20260515-015459-clean-longctx-check`: code reverted to `a486c90`, `./ds4_test --long-context` returned OK.
-  - Conclusion: top-k/indexer is high leverage for generation speed, but this form is correctness-invalid and possibly compile-layout/numerical-sensitivity prone. Future top-k work must preserve the old selection/order behavior at token-byte parity, not just the top-k set.
+  - Later interpretation: this was contaminated by the pre-`c9dd949` long-context bug and/or the low-reserve cache policy. The post-`c9dd949` retest above is the active decision.
 - 8192+tail top-k candidate merge, run `~/ds4/codex-runs/20260515-030000-topk8192-tail-ab`: speed signal repeated at `ctx=32768`, 512 generated tokens (`42.08` / `42.06` gen t/s vs `40.33` / `40.31` with `DS4_CUDA_NO_TOPK8192_TAIL=1`). Rejected because the clean validation run `~/ds4/codex-runs/20260515-031000-topk8192-tail-longctx` failed `./ds4_test --long-context` with the same Alice wrong-assignment regression (`got 50 expected 52`). Conclusion: the near-8192 top-k region is a real speed lever, but even a more conservative candidate-merge shortcut is not correctness-safe.
 - CUB per-4096-chunk top-k sorter, run `~/ds4/codex-runs/20260515-033300-topk-chunk-cub-ab`: smaller but repeatable speed signal at `ctx=32768`, 512 generated tokens (`41.54` / `41.54` gen t/s vs `40.33` / `40.28` baseline). Rejected because validation run `~/ds4/codex-runs/20260515-034300-topk-chunk-cub-longctx` failed `./ds4_test --long-context` with the same Alice wrong-assignment regression (`got 50 expected 52`). Conclusion: speculative faster top-k sorters are closed for now; any future top-k work needs a selection-comparison harness against the current path before benchmarking.
 - Postscript on the top-k rejections: `~/ds4/codex-runs/20260515-042542-longctx-env-matrix` showed that `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` fails `./ds4_test --long-context` even without a top-k fast path. Treat earlier top-k long-context failures that used the low-reserve policy as contaminated. The speed signal remains interesting, but it must be revalidated under the correctness-safe default reserve.
@@ -432,8 +447,8 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
 5. **Indexed attention / indexer redesign**
    - Highest combined decode target after the patched Nsight profile: indexed attention, dense attention, top-k chunk/merge, and indexer score/direct kernels.
    - Built-in fallback toggles and single-token grouped-head routing did not help.
-   - Three top-k sorter shortcuts produced real speed signals, but earlier long-context failures were likely contaminated by now-fixed upstream correctness issues and/or low-reserve cache policy.
-   - Next useful work here is a correctness-preserving harness under the default reserve. First prove the harness is a no-op by preserving the current `make test` failure shape, then compare selected index/order behavior against the current chunked path before accepting any top-k or attention-gather speedup.
+   - Post-`c9dd949`, the narrow CUB top-k fast path for `8192 < n_comp <= 8704` is adopted after preserving the current `make test` failure shape.
+   - Next useful work here is a correctness-preserving harness for larger `n_comp` ranges. First prove the harness is a no-op by preserving the current `make test` failure shape, then compare selected index/order behavior against the current chunked path before accepting any broader top-k or attention-gather speedup.
 
 6. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.
