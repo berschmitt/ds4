@@ -3055,7 +3055,8 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t trust_visible_topk) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -3102,11 +3103,18 @@ __global__ static void attention_indexed_mixed_kernel(
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
     }
-    for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
-        int32_t c = topk[(uint64_t)t * top_k + i];
-        if (c >= 0 && (uint32_t)c < visible_comp) {
-            uint32_t slot = atomicAdd(&comp_count, 1u);
-            if (slot < 512u) comp_rows[slot] = (uint32_t)c;
+    if (trust_visible_topk && visible_comp >= top_k) {
+        for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
+            comp_rows[i] = (uint32_t)topk[(uint64_t)t * top_k + i];
+        }
+        if (threadIdx.x == 0) comp_count = top_k;
+    } else {
+        for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
+            int32_t c = topk[(uint64_t)t * top_k + i];
+            if (c >= 0 && (uint32_t)c < visible_comp) {
+                uint32_t slot = atomicAdd(&comp_count, 1u);
+                if (slot < 512u) comp_rows[slot] = (uint32_t)c;
+            }
         }
     }
     __syncthreads();
@@ -7247,7 +7255,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   window,
                                                   ratio,
                                                   n_head,
-                                                  head_dim);
+                                                  head_dim,
+                                                  getenv("DS4_CUDA_NO_INDEXED_ATTENTION_VISIBLE_FASTPATH") == NULL);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
