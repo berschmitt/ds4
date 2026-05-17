@@ -205,10 +205,15 @@ Validation status for `5347041`:
     - Enabled: `42.79`, `42.68` gen t/s.
     - Disabled with `DS4_CUDA_NO_TOPK8704=1`: `40.24`, `40.24` gen t/s.
     - Net result: about `+6.1%` generation throughput for the upstream-benchmark context shape.
-  - Correctness gates:
-    - `DS4_TEST_MODEL=$HOME/ds4/ds4flash.gguf ./ds4_test --long-context`: OK with default reserve.
-    - `DS4_TEST_MODEL=$HOME/ds4/ds4flash.gguf make test CUDA_ARCH=sm_120`: same known default-reserve shape as synced main: `logprob-vectors / long_memory_archive`, `7` assertion failures; no new failure shape.
-  - Decision: keep as a small fork patch. The earlier May 15 top-k rejection is now treated as a contaminated historical result because it predated upstream `c9dd949` and overlapped with low-reserve correctness failures.
+- Correctness gates:
+  - `DS4_TEST_MODEL=$HOME/ds4/ds4flash.gguf ./ds4_test --long-context`: OK with default reserve.
+  - `DS4_TEST_MODEL=$HOME/ds4/ds4flash.gguf make test CUDA_ARCH=sm_120`: same known default-reserve shape as synced main: `logprob-vectors / long_memory_archive`, `7` assertion failures; no new failure shape.
+- Decision: keep as a small fork patch. The earlier May 15 top-k rejection is now treated as a contaminated historical result because it predated upstream `c9dd949` and overlapped with low-reserve correctness failures.
+- Post-adoption stage profile:
+  - Run: `~/ds4/codex-runs/20260517-231138-post-topk-stage-profile`.
+  - Result with profiling overhead: `511.03` prefill t/s, `38.04` gen t/s.
+  - Decode stage totals: attention `24.73%`, routed MoE `13.89%`, compressor/indexer `12.52%`, attention output `9.97%`, `ffn_hc_pre` + `attn_hc_pre` `18.75%` combined.
+  - Next target should be attention or compressor/indexer; PR #145's down path is not on the one-token decode path.
 
 ## Rejected RTX Pro 6000 probes
 
