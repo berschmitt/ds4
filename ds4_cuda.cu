@@ -363,7 +363,8 @@ static const unsigned char *cuda_q4_from_f16_ptr(
         uint64_t offset,
         uint64_t weight_bytes_f16,
         uint64_t in_dim,
-        uint64_t out_dim) {
+        uint64_t out_dim,
+        int allow_build) {
     auto exact = g_q4_by_offset.find(offset);
     if (exact != g_q4_by_offset.end()) {
         const cuda_q4_range &r = g_q4_ranges[exact->second];
@@ -372,6 +373,7 @@ static const unsigned char *cuda_q4_from_f16_ptr(
             return r.device_ptr;
         }
     }
+    if (!allow_build) return NULL;
 
     const char *f16_src = cuda_model_range_ptr(model_map, offset, weight_bytes_f16, "f16_for_q4");
     if (!f16_src) return NULL;
@@ -1709,7 +1711,7 @@ extern "C" int ds4_gpu_cache_q4_from_f16_range(const void *model_map, uint64_t m
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (!cuda_q4_f16_decode_allowed()) return 1;
-    if (cuda_q4_from_f16_ptr(model_map, offset, bytes, in_dim, out_dim)) return 1;
+    if (cuda_q4_from_f16_ptr(model_map, offset, bytes, in_dim, out_dim, 1)) return 1;
     fprintf(stderr, "ds4: CUDA q4-from-f16 preload skipped %s\n", label ? label : "f16");
     return 1;
 }
@@ -6424,8 +6426,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         n_tok == 1u &&
         cuda_q4_f16_decode_allowed();
     if (q4_f16_decode) {
+        const int allow_q4_build = getenv("DS4_CUDA_Q4_F16_CACHE_ONLY") == NULL;
         const unsigned char *w_q4 = cuda_q4_from_f16_ptr(model_map, weight_offset,
-                                                         weight_bytes, in_dim, out_dim);
+                                                         weight_bytes, in_dim, out_dim,
+                                                         allow_q4_build);
         if (w_q4) {
             const uint64_t blocks = (in_dim + 31u) / 32u;
             const uint64_t xq_bytes = blocks * 32u;
@@ -6540,10 +6544,13 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
     if (q4_pair_decode) {
+        const int allow_q4_build = getenv("DS4_CUDA_Q4_F16_CACHE_ONLY") == NULL;
         const unsigned char *w0_q4 = cuda_q4_from_f16_ptr(model_map, weight0_offset,
-                                                          weight_bytes, in_dim, out_dim);
+                                                          weight_bytes, in_dim, out_dim,
+                                                          allow_q4_build);
         const unsigned char *w1_q4 = cuda_q4_from_f16_ptr(model_map, weight1_offset,
-                                                          weight_bytes, in_dim, out_dim);
+                                                          weight_bytes, in_dim, out_dim,
+                                                          allow_q4_build);
         if (w0_q4 && w1_q4) {
             const uint64_t blocks = (in_dim + 31u) / 32u;
             const uint64_t xq_bytes = blocks * 32u;
