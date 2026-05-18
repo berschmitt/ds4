@@ -7691,13 +7691,20 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         int8_t *xq = (int8_t *)tmp;
         float *xscale = (float *)((char *)tmp + scale_offset);
         const int use_dp4a = cuda_q8_use_dp4a();
+        cudaEvent_t q8_prof_start = NULL;
+        cudaEvent_t q8_prof_stop = NULL;
+        const int q8_profile = (n_tokens == 1 && cuda_q8_decode_profile_begin(&q8_prof_start, &q8_prof_stop));
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
         quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
                                                 xscale,
                                                 (const float *)heads->ptr,
                                                 group_dim,
                                                 blocks_a);
-        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
+        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) {
+            cuda_q8_decode_profile_finish("attn_output_a_batch", group_dim, low_dim,
+                                          q8_profile, q8_prof_start, q8_prof_stop);
+            return 0;
+        }
         dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
         grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
                                                           out_a,
@@ -7709,7 +7716,13 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                           n_tokens,
                                                           blocks_a,
                                                           use_dp4a);
-        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
+        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) {
+            cuda_q8_decode_profile_finish("attn_output_a_batch", group_dim, low_dim,
+                                          q8_profile, q8_prof_start, q8_prof_stop);
+            return 0;
+        }
+        cuda_q8_decode_profile_finish("attn_output_a_batch", group_dim, low_dim,
+                                      q8_profile, q8_prof_start, q8_prof_stop);
     }
 
     (void)out_b;
@@ -7757,13 +7770,20 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
+    cudaEvent_t q8_prof_start = NULL;
+    cudaEvent_t q8_prof_stop = NULL;
+    const int q8_profile = cuda_q8_decode_profile_begin(&q8_prof_start, &q8_prof_stop);
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
                                             xscale,
                                             (const float *)heads->ptr,
                                             group_dim,
                                             blocks_a);
-    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) {
+        cuda_q8_decode_profile_finish("attn_output_a", group_dim, low_dim,
+                                      q8_profile, q8_prof_start, q8_prof_stop);
+        return 0;
+    }
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
     grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
                                                       out_a,
@@ -7775,7 +7795,10 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       1,
                                                       blocks_a,
                                                       use_dp4a);
-    return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
+    int q8_ok = cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
+    cuda_q8_decode_profile_finish("attn_output_a", group_dim, low_dim,
+                                  q8_profile, q8_prof_start, q8_prof_stop);
+    return q8_ok;
 }
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
