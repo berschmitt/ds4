@@ -193,6 +193,37 @@ This makes `hc_` the only plausible near-term preset. It is not a huge win, but 
 
 Default `make test CUDA_ARCH=sm_120` on the branch, with no Q4 env vars, preserves the known failure shape: `long-context`, `tool-call-quality`, `metal-kernels`, and `server` pass; `logprob-vectors / long_memory_archive` reports the same 7 failures. This supports treating the branch as inert-by-default.
 
+Q8-derived Q4 follow-up:
+
+- Code points:
+  - `e5a32cc`: opt-in Q8->Q4 cache and generic single-decode dispatch.
+  - `f8245ab`: opt-in Q8->Q4 HC-expand dispatch.
+  - `46b66d1`: split Q8 Q4 preload from generic single dispatch so HC/attention output can be isolated.
+  - `f7d078c`: opt-in fused `attn_output_a` low-projection Q4 path.
+- All Q8-derived Q4 paths are gated separately by `DS4_CUDA_Q4_Q8_DECODE=1` and are not part of the recommended preset.
+- Runs:
+  - Generic single-Q8 subset scan: `~/ds4/codex-runs/20260518-080959-q8-q4-stage2-scan`.
+  - HC-expand scan: `~/ds4/codex-runs/20260518-082313-q8-q4-hcexp-fixed`.
+  - Attention-output scan: `~/ds4/codex-runs/20260518-082807-q8-q4-attn-output-scan`.
+
+`ctx=4096`, `gen_tokens=512`, all with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` and `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`:
+
+| Policy | Prefill t/s | Gen t/s | Notes |
+|---|---:|---:|---|
+| baseline | 570.21 | 45.87 | no Q4 |
+| F16 `hc_` | 564.72 | 48.73 | current balanced preset |
+| F16 `hc_` + Q8 `attn_q_b` single | 512.78 | 49.97 | small gen gain, large prefill loss |
+| F16 `hc_` + Q8 `attn_q_a` single | 549.95 | 48.68 | no useful gen gain |
+| F16 `hc_` + Q8 `attn_kv` single | 556.30 | 48.92 | no useful gen gain |
+| F16 `hc_` + Q8 shared-expert singles | 537-539 | 48.75-48.78 | no useful gen gain |
+| F16 `hc_` + Q8 q-proj singles | 497.48 | 49.78 | poor tradeoff |
+| F16 `hc_` + Q8 `attn_output_b` HC-expand | 510.34 | 49.88 | small gen gain, large prefill loss |
+| F16 `hc_` + Q8 `ffn_down_shexp` HC-expand | 539.84 | 48.94 | no useful gen gain |
+| F16 `hc_` + Q8 `attn_output_a` fused low | 511.02 | 49.78 | fused path works, but poor tradeoff |
+| F16 `hc_` + Q8 `attn_output_a,b` | 468.07 | 50.88 | highest gen in this scan, but gives up too much prefill |
+
+Interpretation: the selective Q8-derived Q4 paths are technically working, but they are not recommended. They mostly recover another `+1` to `+2` generation t/s while cutting prefill by `50` to `95` t/s. This confirms the same memory-policy problem seen in the full external Q4 branch: preloading larger Q8-derived Q4 tensors competes with the q8->f16 prefill cache on a 96 GB card. Keep the Q8 Q4 code as opt-in research scaffolding for now, but do not promote any Q8 Q4 preset unless a later memory policy preserves prefill.
+
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
 - Run: `~/ds4/codex-runs/20260517-043821-sync-baseline`
@@ -600,10 +631,11 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Do not use the full preload policy directly. Full Q4 preload (`3.55 GiB`) plus q8->f16 cache does not fit cleanly on this 96 GB card; lowering the q8->f16 reserve to `768` or `512` MB OOMs, while higher reserves leave q8->f16 effectively empty and lose prefill.
    - First port candidate: Q4 cache for F16-derived decode matvecs. The component scan drops from `47.61` to `40.82` gen t/s when F16-derived Q4 is disabled, making this the largest contributor.
    - May 18 status: `codex/q4-f16-decode` implements this candidate behind `DS4_CUDA_Q4_DECODE=1`. Full F16-Q4 reaches `47.50` gen t/s at `ctx=32768`, but the best balanced subset is currently `DS4_CUDA_Q4_F16_FILTER=hc_` with `45.59` gen t/s and much lower prefill cost.
-   - Second port candidate: generic single Q8->Q4 dispatch. Disabling all generic Q8->Q4 drops to `44.72`; disabling only single Q8->Q4 drops to `45.98`.
-   - Third port candidate: `attn_output_a` and fused `attn_output_b`/HC-expand. These are real but smaller (`46.49` and `46.30` when disabled). Q4 pair is effectively neutral in this benchmark.
+   - Second port candidate result: generic single Q8->Q4 dispatch works technically, but is not a useful preset. The best narrow case (`attn_q_b`) moved generation from `48.73` to `49.97` t/s on top of F16 `hc_`, while prefill fell from `564.72` to `512.78` t/s.
+   - Third port candidate result: `attn_output_a` and fused `attn_output_b`/HC-expand Q4 also work technically, but show the same tradeoff. Best combined short-context result reached `50.88` gen t/s, but prefill fell to `468.07` t/s.
+   - Q4 pair is still effectively neutral in the external component benchmark and has not been ported locally.
    - Keep everything behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches so quality/performance can be bisected by tensor family.
-   - Next gate before adoption: repeat `ctx=32768`, 512-token generation for `hc_` and all-F16-Q4, then run the known correctness gate shape. If the `hc_` subset is stable, consider it an opt-in RTX preset; do not make full F16-Q4 default because it gives up too much prefill.
+   - Current adoption candidate remains only F16 `hc_`. Q8-derived Q4 paths should stay research-only until memory policy can preserve the q8->f16 prefill cache.
 
 2. **Logprob-vector parity probe**
    - The Alice long-context failure is resolved on the post-`c9dd949` sync, but `make test CUDA_ARCH=sm_120` still fails `logprob-vectors / long_memory_archive` under the default reserve.
