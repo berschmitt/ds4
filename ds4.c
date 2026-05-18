@@ -15809,7 +15809,7 @@ const char *ds4_backend_name(ds4_backend backend) {
 
 int ds4_accelerator_profiler_start(ds4_backend backend) {
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__)
-    if (backend == DS4_BACKEND_CUDA) return ds4_gpu_profiler_start();
+    if (backend == DS4_BACKEND_CUDA) return ds4_gpu_profiler_start() ? 0 : 1;
 #else
     (void)backend;
 #endif
@@ -15818,7 +15818,7 @@ int ds4_accelerator_profiler_start(ds4_backend backend) {
 
 int ds4_accelerator_profiler_stop(ds4_backend backend) {
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__)
-    if (backend == DS4_BACKEND_CUDA) return ds4_gpu_profiler_stop();
+    if (backend == DS4_BACKEND_CUDA) return ds4_gpu_profiler_stop() ? 0 : 1;
 #else
     (void)backend;
 #endif
