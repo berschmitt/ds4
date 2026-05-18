@@ -1423,6 +1423,22 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     return true;
 }
 
+static bool accelerator_cuda_q4_from_f16_preload_tensor_name(const char *name) {
+    if (!name) return false;
+    return strstr(name, ".indexer.attn_q_b.weight") != NULL ||
+           strstr(name, ".indexer.proj.weight") != NULL ||
+           strstr(name, ".attn_compressor_kv.weight") != NULL ||
+           strstr(name, ".attn_compressor_gate.weight") != NULL ||
+           strstr(name, ".attn_compressor_ape.weight") != NULL ||
+           strstr(name, ".indexer_compressor_kv.weight") != NULL ||
+           strstr(name, ".indexer_compressor_gate.weight") != NULL ||
+           strstr(name, ".indexer_compressor_ape.weight") != NULL ||
+           strstr(name, ".ffn_gate_inp.weight") != NULL ||
+           strstr(name, ".hc_attn_fn.weight") != NULL ||
+           strstr(name, ".hc_ffn_fn.weight") != NULL ||
+           strcmp(name, "output_hc_fn.weight") == 0;
+}
+
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
@@ -1447,6 +1463,33 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
                         (int)t->name.len, t->name.ptr);
                 return false;
             }
+        }
+    }
+    if (getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+        getenv("DS4_CUDA_F16_NO_Q4") == NULL &&
+        getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
+        getenv("DS4_CUDA_NO_Q4_PRELOAD") == NULL) {
+        const double q4_t0 = now_sec();
+        uint64_t q4f16_count = 0;
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const ds4_tensor *t = &m->tensors[i];
+            if (t->bytes == 0 || t->ndim != 2 || t->type != DS4_TENSOR_F16) continue;
+            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+            char name[128];
+            snprintf(name, sizeof(name), "%.*s", (int)t->name.len, t->name.ptr);
+            if (!accelerator_cuda_q4_from_f16_preload_tensor_name(name)) continue;
+            char label[160];
+            snprintf(label, sizeof(label), "q4f16:%s", name);
+            if (ds4_gpu_cache_q4_from_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+                fprintf(stderr, "ds4: accelerator failed to cache Q4-from-F16 tensor %s\n", name);
+                return false;
+            }
+            q4f16_count++;
+        }
+        if (q4f16_count != 0) {
+            fprintf(stderr, "ds4: CUDA preloaded Q4-from-F16 decode cache for %llu tensors in %.3fs\n",
+                    (unsigned long long)q4f16_count,
+                    now_sec() - q4_t0);
         }
     }
     if (cached != 0) {
