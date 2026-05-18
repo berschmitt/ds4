@@ -281,6 +281,13 @@ Operational note: future fallback-disabling probes should use shorter generation
   - Pair2: `41.10`, `41.07` gen t/s.
   - Default: `42.65`, `42.65` gen t/s.
   - Conclusion: sharing the quantized input/LUT setup across two selected experts loses too much block-level parallelism. Do not carry.
+- MoE decode policy scan, run `~/ds4/codex-runs/20260518-050009-moe-policy-scan`: no built-in MoE fallback switch exposed a new generation win at `ctx=32768`, 128 generated tokens.
+  - Base: `43.07` gen t/s.
+  - `DS4_CUDA_MOE_NO_DECODE_LUT_GATE=1`: `32.91` gen t/s. The decode LUT gate path is critical.
+  - `DS4_CUDA_MOE_NO_DECODE_LUT_H16=1`: `41.86` gen t/s. The half-warp LUT path is a real but smaller win.
+  - `DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6=1`: `42.98` gen t/s. Direct down-sum6 is roughly neutral in this short screen, not an obvious missing win.
+  - Decode-only MoE profile from the same run, split to `tokens=1`: 2752 routed-MoE calls averaged `0.004 ms` xq, `0.057 ms` gate/up, `0.004 ms` mid quant, `0.020 ms` down, `0.086 ms` total per layer call. Across 43 layers this is about `3.7 ms/token`, with gate/up the larger MoE bucket.
+  - Conclusion: current MoE decode fast paths are carrying throughput. Future MoE work should target a concrete new gate/up or direct-down kernel idea, not fallback toggles.
 - Forced ordered one-token f16 matmul on post-topk8704 `main`, run `~/ds4/codex-runs/20260518-002007-f16-ordered-policy-ab`: confirms the Blackwell default should stay generic.
   - Base: average `42.64` gen t/s over 3 runs.
   - `DS4_CUDA_USE_ORDERED_F16_MATMUL=1`: average `40.78` gen t/s over 3 runs.
@@ -519,7 +526,9 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
 6. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.
    - PR #145's tile8 down rowspan path is not a decode target because one-token decode takes the direct `sum6` down route.
-   - First concrete task: inspect current decode-specific MoE gate/up and direct-down helpers before writing new kernels.
+   - May 18 switch scan confirmed the current decode LUT gate path is critical (`32.91` gen t/s without it vs `43.07` base), the half-warp LUT path matters (`41.86` without it), and direct down-sum6 is roughly neutral in a short screen (`42.98` without it).
+   - Decode-only MoE profile puts routed MoE at about `3.7 ms/token`, mostly gate/up. That is worth tracking, but it is not the whole generation gap.
+   - Next concrete work here requires a new kernel idea for gate/up or direct down; more fallback toggles are low value.
    - Keep only changes that improve `ctx=32768`, 512-token generation by a repeatable margin.
 
 7. **q8 decode matvec path**
