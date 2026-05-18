@@ -771,6 +771,14 @@ static int cuda_q4_q8_hcexp_allowed(void) {
            getenv("DS4_CUDA_Q8_NO_Q4_HCEXP") == NULL;
 }
 
+static int cuda_q4_q8_attn_out_allowed(void) {
+    return cuda_q8_use_dp4a() &&
+           getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q4_Q8_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4_ATTN_OUT") == NULL;
+}
+
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
         getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
@@ -2433,6 +2441,62 @@ __global__ static void matmul_q4_0_hc_expand_preq_warp8_kernel(
             out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
         }
     }
+}
+
+__global__ static void grouped_q4_0_a_fused_quant_warp8_kernel(
+        float *low,
+        const unsigned char *w,
+        const float *heads,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint64_t blocks) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row_in_group = (uint64_t)blockIdx.x * 8u + warp;
+    const uint32_t group = blockIdx.y;
+    if (group >= n_groups) return;
+
+    extern __shared__ unsigned char shared[];
+    int8_t *xq = (int8_t *)shared;
+    const uint64_t scale_offset = ((blocks * 32u) + 15u) & ~15ull;
+    float *xscale = (float *)(shared + scale_offset);
+    const float *xr = heads + (uint64_t)group * group_dim;
+
+    for (uint64_t b = warp; b < blocks; b += 8u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = group_dim - i0 < 32u ? group_dim - i0 : 32u;
+        float v = 0.0f;
+        float a = 0.0f;
+        if (lane < bn) {
+            v = xr[i0 + lane];
+            a = fabsf(v);
+        }
+        for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+            a = fmaxf(a, __shfl_down_sync(0xffffffffu, a, stride));
+        }
+        a = __shfl_sync(0xffffffffu, a, 0);
+        const float d = a / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        if (lane == 0u) xscale[b] = d;
+        int q = lane < bn ? (int)lrintf(v * id) : 0;
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        xq[b * 32u + lane] = (int8_t)q;
+    }
+    __syncthreads();
+
+    if (row_in_group >= rank) return;
+    const uint64_t wrow = (uint64_t)group * rank + row_in_group;
+    const __half *scales_row = (const __half *)(w + wrow * blocks * 18u);
+    const unsigned char *packed_row = w + wrow * blocks * 18u + blocks * 2u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        float scale = __half2float(scales_row[b]);
+        int32_t dot = q4_block_dot(packed_row + b * 16u, xq + b * 32u);
+        acc += scale * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) low[(uint64_t)group * rank + row_in_group] = acc;
 }
 
 __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
@@ -8152,6 +8216,29 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
             cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
     if (!out_a) return 0;
+
+    if (cuda_q4_q8_attn_out_allowed() &&
+        getenv("DS4_CUDA_NO_ATTN_OUT_A_FUSED") == NULL &&
+        blocks_a <= 128u) {
+        const int allow_q4_build = getenv("DS4_CUDA_Q4_Q8_CACHE_ONLY") == NULL;
+        const unsigned char *out_a_q4 = cuda_q4_from_q8_ptr(model_map, out_a_offset,
+                                                            out_a_bytes, group_dim, low_dim,
+                                                            allow_q4_build);
+        if (out_a_q4) {
+            const uint64_t fused_scale_offset = ((blocks_a * 32u) + 15u) & ~15ull;
+            const uint64_t shared_bytes = fused_scale_offset + blocks_a * sizeof(float);
+            dim3 fgrid(((unsigned)rank + 7u) / 8u, n_groups, 1);
+            grouped_q4_0_a_fused_quant_warp8_kernel<<<fgrid, 256, (size_t)shared_bytes>>>(
+                    (float *)low->ptr,
+                    out_a_q4,
+                    (const float *)heads->ptr,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    blocks_a);
+            return cuda_ok(cudaGetLastError(), "attention_output_low_q4_fused launch");
+        }
+    }
 
     const uint64_t x_rows = (uint64_t)n_groups;
     const uint64_t xq_bytes = x_rows * blocks_a * 32u;
