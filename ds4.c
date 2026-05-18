@@ -116,6 +116,131 @@ static int g_ds4_lock_fd = -1;
 #define DS4_MAYBE_UNUSED
 #endif
 
+typedef struct ds4_decode_attn_shape_stat {
+    uint64_t calls;
+    uint64_t indexed_calls;
+    uint64_t dense_calls;
+    uint64_t n_raw_sum;
+    uint64_t n_comp_sum;
+    uint64_t n_selected_sum;
+    uint64_t top_k_sum;
+    uint64_t ratio_sum;
+    uint32_t min_pos;
+    uint32_t max_pos;
+    uint32_t min_raw;
+    uint32_t max_raw;
+    uint32_t min_comp;
+    uint32_t max_comp;
+    uint32_t min_selected;
+    uint32_t max_selected;
+} ds4_decode_attn_shape_stat;
+
+static pthread_mutex_t g_decode_attn_shape_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static ds4_decode_attn_shape_stat g_decode_attn_shape_stats[DS4_N_LAYER];
+static int g_decode_attn_shape_stats_init = 0;
+static int g_decode_attn_shape_stats_enabled = 0;
+
+static void ds4_decode_attn_shape_stats_print(void) {
+    if (!g_decode_attn_shape_stats_enabled) return;
+    uint64_t total_calls = 0;
+    uint64_t total_indexed = 0;
+    uint64_t total_dense = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        total_calls += g_decode_attn_shape_stats[il].calls;
+        total_indexed += g_decode_attn_shape_stats[il].indexed_calls;
+        total_dense += g_decode_attn_shape_stats[il].dense_calls;
+    }
+    if (total_calls == 0) return;
+    fprintf(stderr,
+            "ds4: decode attention shape stats summary calls=%" PRIu64
+            " indexed=%" PRIu64 " dense=%" PRIu64 "\n",
+            total_calls,
+            total_indexed,
+            total_dense);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_decode_attn_shape_stat *s = &g_decode_attn_shape_stats[il];
+        if (s->calls == 0) continue;
+        const double denom = (double)s->calls;
+        fprintf(stderr,
+                "ds4: decode attention shape layer=%u calls=%" PRIu64
+                " indexed=%" PRIu64 " dense=%" PRIu64
+                " pos=%u..%u raw=%u..%u avg_raw=%.1f"
+                " comp=%u..%u avg_comp=%.1f"
+                " selected=%u..%u avg_selected=%.1f"
+                " avg_top_k=%.1f avg_ratio=%.1f\n",
+                il,
+                s->calls,
+                s->indexed_calls,
+                s->dense_calls,
+                s->min_pos,
+                s->max_pos,
+                s->min_raw,
+                s->max_raw,
+                (double)s->n_raw_sum / denom,
+                s->min_comp,
+                s->max_comp,
+                (double)s->n_comp_sum / denom,
+                s->min_selected,
+                s->max_selected,
+                (double)s->n_selected_sum / denom,
+                (double)s->top_k_sum / denom,
+                (double)s->ratio_sum / denom);
+    }
+}
+
+static bool ds4_decode_attn_shape_stats_should_record(void) {
+    if (!g_decode_attn_shape_stats_init) {
+        g_decode_attn_shape_stats_init = 1;
+        g_decode_attn_shape_stats_enabled =
+            getenv("DS4_METAL_DECODE_ATTENTION_SHAPE_STATS") != NULL;
+        if (g_decode_attn_shape_stats_enabled) {
+            atexit(ds4_decode_attn_shape_stats_print);
+        }
+    }
+    return g_decode_attn_shape_stats_enabled != 0;
+}
+
+static void ds4_decode_attn_shape_stats_record(
+        uint32_t il,
+        uint32_t pos,
+        uint32_t n_raw,
+        uint32_t n_comp,
+        uint32_t n_selected,
+        uint32_t top_k,
+        uint32_t ratio,
+        bool     indexed) {
+    if (il >= DS4_N_LAYER || !ds4_decode_attn_shape_stats_should_record()) return;
+    pthread_mutex_lock(&g_decode_attn_shape_stats_lock);
+    ds4_decode_attn_shape_stat *s = &g_decode_attn_shape_stats[il];
+    if (s->calls == 0) {
+        s->min_pos = s->max_pos = pos;
+        s->min_raw = s->max_raw = n_raw;
+        s->min_comp = s->max_comp = n_comp;
+        s->min_selected = s->max_selected = n_selected;
+    } else {
+        if (pos < s->min_pos) s->min_pos = pos;
+        if (pos > s->max_pos) s->max_pos = pos;
+        if (n_raw < s->min_raw) s->min_raw = n_raw;
+        if (n_raw > s->max_raw) s->max_raw = n_raw;
+        if (n_comp < s->min_comp) s->min_comp = n_comp;
+        if (n_comp > s->max_comp) s->max_comp = n_comp;
+        if (n_selected < s->min_selected) s->min_selected = n_selected;
+        if (n_selected > s->max_selected) s->max_selected = n_selected;
+    }
+    s->calls++;
+    if (indexed) {
+        s->indexed_calls++;
+    } else {
+        s->dense_calls++;
+    }
+    s->n_raw_sum += n_raw;
+    s->n_comp_sum += n_comp;
+    s->n_selected_sum += n_selected;
+    s->top_k_sum += top_k;
+    s->ratio_sum += ratio;
+    pthread_mutex_unlock(&g_decode_attn_shape_stats_lock);
+}
+
 /* =========================================================================
  * GGUF Quant Block Formats.
  * =========================================================================
@@ -9706,7 +9831,17 @@ static bool metal_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
-        if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
+        const bool use_indexed_attention =
+            n_comp != 0 && comp_selected != NULL && n_selected != 0;
+        ds4_decode_attn_shape_stats_record(il,
+                                           pos,
+                                           n_raw,
+                                           n_comp,
+                                           use_indexed_attention ? n_selected : 0,
+                                           use_indexed_attention ? n_selected : 0,
+                                           ds4_layer_compress_ratio(il),
+                                           use_indexed_attention);
+        if (use_indexed_attention) {
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
