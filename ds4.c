@@ -1439,6 +1439,26 @@ static bool accelerator_cuda_q4_from_f16_preload_tensor_name(const char *name) {
            strcmp(name, "output_hc_fn.weight") == 0;
 }
 
+static bool accelerator_cuda_q4_from_f16_filter_match(const char *name) {
+    const char *filter = getenv("DS4_CUDA_Q4_F16_FILTER");
+    if (!filter || !filter[0]) return true;
+    const char *p = filter;
+    while (*p) {
+        while (*p == ',' || *p == ' ') p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && end[-1] == ' ') end--;
+        if (end > start) {
+            const size_t n = (size_t)(end - start);
+            for (const char *h = name; *h; h++) {
+                if (strncmp(h, start, n) == 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
@@ -1478,6 +1498,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
             char name[128];
             snprintf(name, sizeof(name), "%.*s", (int)t->name.len, t->name.ptr);
             if (!accelerator_cuda_q4_from_f16_preload_tensor_name(name)) continue;
+            if (!accelerator_cuda_q4_from_f16_filter_match(name)) continue;
             char label[160];
             snprintf(label, sizeof(label), "q4f16:%s", name);
             if (ds4_gpu_cache_q4_from_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
