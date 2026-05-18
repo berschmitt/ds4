@@ -339,6 +339,22 @@ Fallback audit at `ctx=32768`:
 - Filtered stderr showed no hard CUDA allocation failures. The recurring fallback was q8 f16 cache budget exhaustion only: 1056 budget messages after 192 q8 f16 cache entries and full model tensor-span caching.
 - Conclusion from this pre-`c9dd949` run: upstream's allocation-fallback hypothesis was directionally plausible for q8 f16 cache pressure, but the evidence did not show an unknown buffer allocation failure path. Later upstream fixes changed the long-context result, but low-reserve settings still need full-test validation.
 
+Q8 decode label profile:
+
+- Branch: `codex/q8-decode-stats`
+- Run: `~/ds4/codex-runs/20260518-051804-q8-decode-stats`
+- Method: opt-in `DS4_CUDA_Q8_DECODE_STATS=1` CUDA-event timing around q8 decode callsites. This intentionally synchronizes and slows the run, so use the totals for attribution, not throughput.
+- Bench under instrumentation: `ctx=32768`, 64 generated tokens, `508.36` prefill t/s, `39.16` gen t/s.
+- Top q8 decode buckets over the instrumented run:
+  - `q8_hc_expand` `8192->4096`: `81.931 ms` total, `0.029771 ms` average, 2752 calls.
+  - `attn_output_a` `4096->8192`: `79.211 ms` total, `0.028783 ms` average, 2752 calls.
+  - `q8_0` `1024->32768`: `75.477 ms` total, `0.027426 ms` average, 2752 calls.
+  - `q8_pair` `4096->4096`: `45.344 ms` total, `0.016477 ms` average, 2752 calls.
+  - `shared_down_hc_expand` `2048->4096`: `34.351 ms` total, `0.012482 ms` average, 2752 calls.
+  - `q8_pair` `4096->1536`: `29.543 ms` total, `0.010735 ms` average, 2752 calls.
+  - `q8_0` `4096->129280`: `22.677 ms` total, `0.348881 ms` average, 65 calls.
+- Interpretation: the largest named q8 bucket is attention output, split almost evenly between `attn_output_a` and the fused `attn_output_b`/HC-expand path. The q-b projection is the next single large bucket. Shared expert q8 is material but smaller. This narrows q8 work toward attention-output and q-b paths rather than generic q8 toggles.
+
 Reserve correctness boundary:
 
 - Run: `~/ds4/codex-runs/20260515-043330-reserve-correctness-boundary`
@@ -533,7 +549,8 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
 
 7. **q8 decode matvec path**
    - Multiple q8 buckets together are material, and the fp16 cache budget issue is not safely mitigated by reserve tuning.
-   - First concrete task: split q8 decode time by call shape/label if needed, then target the largest repeated decode-only shapes.
+   - May 18 q8 label profiling shows attention-output q8 is the largest named bucket: `attn_output_a` plus fused `attn_output_b`/HC-expand together were about `161 ms` over a 64-token instrumented decode. The q-b projection `1024->32768` was next at about `75 ms`.
+   - First concrete target should be attention-output q8 or q-b, but only with a specific kernel/cache idea. Generic q8 fallback toggles have already been worse.
    - Avoid chasing more q8->fp16 cache policy unless the exactness issue is understood; low reserve values now pass `long-context` after `c9dd949`, but they still perturb full `logprob-vectors` behavior.
 
 8. **Huge-context stability and disk-KV pass**
