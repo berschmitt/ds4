@@ -210,6 +210,7 @@ Q8-derived Q4 follow-up:
   - After-prefill memory-policy scan: `~/ds4/codex-runs/20260518-083957-q8-q4-after-prefill`.
   - After-prefill repeat plus `ctx=32768`: `~/ds4/codex-runs/20260518-084332-q8-q4-after-prefill-repeat`.
   - Reusable phase-switch validation: `~/ds4/codex-runs/20260518-154546-q8-q4-phase-switch`.
+  - Q4 correctness isolation: `~/ds4/codex-runs/20260518-155701-q8-q4-correctness`, `~/ds4/codex-runs/20260518-160145-q4-logprob-isolation`, `~/ds4/codex-runs/20260518-160703-q4-f16-hc-filter-isolation`, and `~/ds4/codex-runs/20260518-161559-q8-q4-after-no-f16`.
 
 `ctx=4096`, `gen_tokens=512`, all with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` and `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`:
 
@@ -270,6 +271,18 @@ Reusable phase-switch validation:
 - Single-request check remained strong at `ctx=4096`, `gen_tokens=1024`: `567.53` prefill / `51.21` gen.
 
 This is now safer as an experimental preset for repeated prefills in one process. It is still not a default because server concurrency and many-session cache ownership have not been stress-tested.
+
+Correctness isolation for the Q4 presets:
+
+- The fast preset, F16 `hc_` plus after-prefill Q8 `attn_output_a,b`, passes `--long-context` and `--tool-call-quality`.
+- It changes `--logprob-vectors`: the known long-memory failures disappear in that run, but a new `short_code_completion step 1 selected token mismatch` appears. Treat this as not parity-preserving.
+- The new short-code mismatch comes from F16-derived Q4, not from the Q8 attention-output cache. Isolating F16 filters shows `hc_attn_fn` alone and `hc_ffn_fn` alone each trigger the mismatch. `output_hc_fn` alone does not, but it also gives no useful generation gain.
+- A cleaner parity-shaped preset is Q8 attention-output after-prefill only, with `DS4_CUDA_F16_NO_Q4=1`. It preserves the known 7-failure `logprob-vectors / long_memory_archive` shape and avoids the short-code mismatch, but performance is lower: `ctx=4096` reached `567.81` prefill / `47.93` gen and `ctx=32768` reached `507.48` prefill / `44.32` gen.
+
+Practical classification:
+
+- **Fast experimental preset:** F16 `hc_` plus after-prefill Q8 `attn_output_a,b`: best decode so far, not logprob-parity preserving.
+- **Cleaner experimental preset:** Q8 `attn_output_a,b` after-prefill with F16 Q4 disabled: smaller decode gain, preserves the current known logprob failure shape.
 
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
@@ -682,6 +695,7 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Third port candidate result: `attn_output_a` and fused `attn_output_b`/HC-expand Q4 also work technically, but show the same tradeoff. Best combined short-context result reached `50.88` gen t/s, but prefill fell to `468.07` t/s.
    - After-prefill memory policy result: delaying selected Q8->Q4 attention-output preload until after prefill preserves almost all F16 `hc_` prefill while keeping the decode gain. At `ctx=32768`, F16 `hc_` was `493.39` prefill / `45.43` gen, while after-prefill Q8 `attn_output_a,b` was `493.13` prefill / `47.26` gen.
    - Reusable phase-switch result: later prefills in the same process now release Q8-derived Q4, preserve F16 `hc_` Q4, re-enable q8->f16, and rebuild Q8-derived Q4 after prefill. Clean `ctx=4096,8192` multi-frontier validation kept generation at `50.74` and `49.24` t/s respectively.
+   - Correctness split: the faster F16 `hc_` + Q8 after-prefill preset adds a `short_code_completion` logprob-vector mismatch. Q8 after-prefill only, with `DS4_CUDA_F16_NO_Q4=1`, preserves the known logprob failure shape but only reaches `44.32` gen t/s at `ctx=32768`.
    - Q4 pair is still effectively neutral in the external component benchmark and has not been ported locally.
    - Keep everything behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches so quality/performance can be bisected by tensor family.
    - Current experimental adoption candidate is now F16 `hc_` plus after-prefill Q8 `attn_output_a,b`. Keep it opt-in until server concurrency and many-session cache behavior are stress-tested.
