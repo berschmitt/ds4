@@ -754,6 +754,14 @@ static int cuda_q4_q8_decode_allowed(void) {
            getenv("DS4_CUDA_Q8_NO_Q4_SINGLE") == NULL;
 }
 
+static int cuda_q4_q8_preload_allowed(void) {
+    return cuda_q8_use_dp4a() &&
+           getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q4_Q8_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4_GENERIC") == NULL;
+}
+
 static int cuda_q4_q8_hcexp_allowed(void) {
     return cuda_q8_use_dp4a() &&
            getenv("DS4_CUDA_Q4_DECODE") != NULL &&
@@ -1841,7 +1849,7 @@ extern "C" int ds4_gpu_cache_q4_from_f16_range(const void *model_map, uint64_t m
 extern "C" int ds4_gpu_cache_q4_0_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    if (!cuda_q4_q8_decode_allowed()) return 1;
+    if (!cuda_q4_q8_preload_allowed()) return 1;
     if (cuda_q4_from_q8_ptr(model_map, offset, bytes, in_dim, out_dim, 1)) return 1;
     fprintf(stderr, "ds4: CUDA q4-from-q8 preload skipped %s\n", label ? label : "q8_0");
     return 1;
