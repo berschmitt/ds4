@@ -104,6 +104,25 @@ Focused `ctx=32768`, `gen_tokens=512`, tuned reserve: 493.76 prefill t/s, 42.61 
 
 Interpretation: the adopted topk8704 patch moved the upstream-shape generation baseline from about `40.6` to about `43.0` t/s at `ctx=32768`. The low-reserve cache policy still matters for prefill but still does not materially move generation. The generation cliff above `ctx=32768` remains: both default and tuned sweeps drop from about `43` t/s at `32768` to about `40` t/s at `34816`, then decay toward `37.8` t/s at `65536`.
 
+External Q4 decode reference branch:
+
+- Source: [`ngc-shj:perf/clean`](https://github.com/antirez/ds4/compare/main...ngc-shj:ds4:perf/clean), fetched locally as `ngc-shj/perf-clean`.
+- Branch snapshot: `b3e92eb`.
+- Local RTX run: `~/ds4/codex-runs/20260518-055406-ngc-shj-perf-clean-q4-probe`.
+- Follow-up memory-policy run: `~/ds4/codex-runs/20260518-055846-ngc-shj-q4-no-f16-probe`.
+- Reserve scan: `~/ds4/codex-runs/20260518-060219-ngc-shj-q4-reserve-scan`.
+
+Observed on RTX Pro 6000:
+
+- The branch builds for `CUDA_ARCH=sm_120`, but produces warnings in CUDA graph/speculative-prefix code. Do not merge wholesale.
+- Q4 preload size: `3.55 GiB`, logged as `345 Q8_0 + 358 F16` tensors.
+- Q4 with the current low-reserve q8->f16 cache policy fails: the two caches compete for the last VRAM margin and prefill hits CUDA OOM.
+- Q4 with `DS4_CUDA_NO_Q8_F16_CACHE=1` fits and smoke generation jumps from about `53.1` t/s to `72.8` t/s on a tiny CLI decode.
+- In the focused `ctx=32768`, `gen_tokens=256` bench, Q4 without q8->f16 cache gives `351.19` prefill t/s and `47.68` gen t/s.
+- In the reserve scan with `gen_tokens=128`, stable Q4 variants cluster around `47.9` gen t/s. Reserves from `1024` to `4096` MB effectively leave q8->f16 cache empty and prefill around `342` t/s; reserves `768` and `512` MB OOM during prefill.
+
+Interpretation: Q4 decode cache is the first external idea that produced a material generation win on this card: about `+11%` in the `ctx=32768` long bench. However, the full Q4 preload does not coexist with the q8->f16 prefill cache on a 96 GB card, so the exact branch trades away a large prefill win. Treat this as a design reference, not a merge candidate. The likely useful path is selective Q4 decode cache for the highest-value decode tensors, preserving as much q8->f16 prefill cache as possible.
+
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
 - Run: `~/ds4/codex-runs/20260517-043821-sync-baseline`
@@ -505,12 +524,19 @@ This points to general decode kernel fragmentation plus real q8/MoE/matvec kerne
 
 Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream benchmark shape first, then re-check longer contexts. Do not spend time on changes that only move short-prompt smoke tests.
 
-1. **Logprob-vector parity probe**
+1. **Selective Q4 decode cache port**
+   - `ngc-shj/perf-clean` proves Q4 decode can move generation on the RTX Pro 6000: about `47.9` gen t/s at `ctx=32768` vs the current `42-43` t/s band.
+   - Do not port the branch wholesale. It is large, includes server batching and CUDA Graph scaffolding, and has warning-prone speculative-prefix code.
+   - Do not use the full preload policy directly. Full Q4 preload (`3.55 GiB`) plus q8->f16 cache does not fit cleanly on this 96 GB card; lowering the q8->f16 reserve to `768` or `512` MB OOMs, while higher reserves leave q8->f16 effectively empty and lose prefill.
+   - First port candidate: the Q4 cache format plus opt-in dispatch for the biggest decode buckets identified locally: `attn_output_a`, fused `attn_output_b`/HC-expand, and q-b. Keep it behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches.
+   - Success criterion: preserve most of the `~47.9` gen t/s Q4 gain while recovering part of the q8->f16 prefill cache win. If selective Q4 cannot beat full-Q4/no-F16 on generation or cannot recover prefill, document and stop.
+
+2. **Logprob-vector parity probe**
    - The Alice long-context failure is resolved on the post-`c9dd949` sync, but `make test CUDA_ARCH=sm_120` still fails `logprob-vectors / long_memory_archive` under the default reserve.
    - Low-reserve q8 f16 cache settings now pass `./ds4_test --long-context`, but they change the full-test failure shape (`128` MB OOMs in logprob vectors; `512` MB flips a `short_code_completion` token).
    - Next correctness work should instrument the logprob-vector cases, especially cache/no-cache and tensor-label differences, rather than continuing to use Alice as the primary gate.
 
-2. **CUDA Graph replay feasibility**
+3. **CUDA Graph replay feasibility**
    - LnaLang4U reports a large CUDA Graphs ON/OFF gap on RTX Pro 6000-class hardware, and DS4 still launches many small decode kernels per token.
    - Do not assume DS4 can get the same gain as SGLang/PyTorch: DS4 is native C/CUDA and already avoids a lot of framework overhead.
    - First step: make a minimal decode capture/replay feasibility probe for a fixed benchmark shape, or prove exactly which token-varying state prevents capture.
@@ -522,24 +548,24 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Post-topk8704 Nsight captured about `4.0M` kernel launches in a delayed decode window. The profile is still dominated by real GPU work, but launch count is high enough that CUDA Graph replay remains a serious track.
    - Useful conclusion: CUDA Graph replay remains plausible only with a proper 128-phase graph cache plus direct node parameter updates/static device parameter buffers. The capture/update probe itself should not be merged, and the next graph attempt should not recapture/update every token.
 
-3. **Benchmark calibration against external references**
+4. **Benchmark calibration against external references**
    - Run or reproduce an apples-to-apples DS4 server benchmark where possible, especially `llama-benchy`-style steady-state `tg`, because DS4's average generation metric and forum/README metrics are not always the same.
    - Keep the 2-card, roughly 4-bit RTX Pro 6000 reports as perspective, not as a direct target for the 1-card roughly 2-bit DS4 path.
    - Maintain the target bands: below 50 t/s is not enough; 55-65 t/s is the first acceptable generation band; 70-80 t/s is the strong target.
 
-4. **Selective q8 f16 cache recovery**
+5. **Selective q8 f16 cache recovery**
    - Prefill is important, and the low-reserve policy showed the upside. The problem is full-test behavior and VRAM headroom, not the old Alice long-context output.
    - Re-test q8 f16 caching by tensor group/label rather than blunt reserve size. The current blunt `128` MB policy is good for benchmark prefill but too aggressive for global use.
    - Goal: recover safe prefill wins while preserving the default logprob-vector failure shape, with no OOMs.
 
-5. **Indexed attention / indexer redesign**
+6. **Indexed attention / indexer redesign**
    - Highest combined decode target after the post-topk8704 Nsight profile: indexed attention, dense attention, top-k8704, and indexer score/direct kernels.
    - Built-in fallback toggles and existing grouped-head single-token routing did not help. The May 18 grouped-head probes were all slower, with the best grouped variant at `40.82` vs `42.67` gen t/s.
    - Decode-only sorting of the selected top-k rows was also slightly slower (`42.57` vs `42.69` gen t/s), so do not chase local row-order cleanup as a standalone patch.
    - Post-`c9dd949`, the narrow CUB top-k fast path for `8192 < n_comp <= 8704` is adopted after preserving the current `make test` failure shape.
    - Next useful work here is either a correctness-preserving harness for larger `n_comp` top-k ranges or a purpose-built one-token indexed-attention kernel. Do not reuse the existing grouped prefill/batch kernel as-is; the A/B says it gives up too much parallelism.
 
-6. **MoE decode kernel inspection**
+7. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.
    - PR #145's tile8 down rowspan path is not a decode target because one-token decode takes the direct `sum6` down route.
    - May 18 switch scan confirmed the current decode LUT gate path is critical (`32.91` gen t/s without it vs `43.07` base), the half-warp LUT path matters (`41.86` without it), and direct down-sum6 is roughly neutral in a short screen (`42.98` without it).
@@ -547,13 +573,13 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Next concrete work here requires a new kernel idea for gate/up or direct down; more fallback toggles are low value.
    - Keep only changes that improve `ctx=32768`, 512-token generation by a repeatable margin.
 
-7. **q8 decode matvec path**
+8. **q8 decode matvec path**
    - Multiple q8 buckets together are material, and the fp16 cache budget issue is not safely mitigated by reserve tuning.
    - May 18 q8 label profiling shows attention-output q8 is the largest named bucket: `attn_output_a` plus fused `attn_output_b`/HC-expand together were about `161 ms` over a 64-token instrumented decode. The q-b projection `1024->32768` was next at about `75 ms`.
    - First concrete target should be attention-output q8 or q-b, but only with a specific kernel/cache idea. Generic q8 fallback toggles have already been worse.
    - Avoid chasing more q8->fp16 cache policy unless the exactness issue is understood; low reserve values now pass `long-context` after `c9dd949`, but they still perturb full `logprob-vectors` behavior.
 
-8. **Huge-context stability and disk-KV pass**
+9. **Huge-context stability and disk-KV pass**
    - Defer until upstream-benchmark generation speed and the remaining logprob-vector exactness issue are better understood.
    - Revisit upstream managed-KV-cache changes separately; they may help huge contexts but can trade off discrete-GPU performance.
    - If KV offload becomes necessary for maximum context, measure the MP700 PRO XT path before considering Optane.
