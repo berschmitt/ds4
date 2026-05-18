@@ -697,6 +697,23 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     (void)cudaGetLastError();
 }
 
+extern "C" void ds4_gpu_release_q8_f16_cache(void) {
+    const uint64_t released = g_q8_f16_bytes;
+    if (!g_q8_f16_ranges.empty()) {
+        (void)cudaDeviceSynchronize();
+        cuda_q8_f16_cache_release_all();
+    }
+    g_q8_f16_disabled_after_oom = 1;
+    g_q8_f16_budget_notice_printed = 0;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA released q8 fp16 cache after prefill "
+                "(released=%.2f GiB); disabled further q8 fp16 rebuilds\n",
+                (double)released / 1073741824.0);
+    }
+    (void)cudaGetLastError();
+}
+
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;

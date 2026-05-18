@@ -1481,6 +1481,47 @@ static bool accelerator_cuda_q4_from_q8_filter_match(const char *name) {
     return accelerator_cuda_env_filter_match(name, "DS4_CUDA_Q4_Q8_FILTER");
 }
 
+static bool accelerator_cuda_q4_from_q8_preload_enabled(void) {
+    return getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q4_Q8_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4_GENERIC") == NULL &&
+           getenv("DS4_CUDA_NO_Q4_PRELOAD") == NULL;
+}
+
+static bool accelerator_cuda_preload_q4_from_q8_model_tensors(
+        const ds4_model *m,
+        const char *phase) {
+    if (!accelerator_cuda_q4_from_q8_preload_enabled()) return true;
+    if (!m || !m->map || m->size == 0) return false;
+
+    const double q4_t0 = now_sec();
+    uint64_t q4q8_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0 || t->ndim != 2 || t->type != DS4_TENSOR_Q8_0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+        char name[128];
+        snprintf(name, sizeof(name), "%.*s", (int)t->name.len, t->name.ptr);
+        if (!accelerator_cuda_q4_from_q8_preload_tensor_name(name)) continue;
+        if (!accelerator_cuda_q4_from_q8_filter_match(name)) continue;
+        char label[160];
+        snprintf(label, sizeof(label), "q4q8:%s", name);
+        if (ds4_gpu_cache_q4_0_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+            fprintf(stderr, "ds4: accelerator failed to cache Q4-from-Q8 tensor %s\n", name);
+            return false;
+        }
+        q4q8_count++;
+    }
+    if (q4q8_count != 0) {
+        fprintf(stderr, "ds4: CUDA preloaded Q4-from-Q8 decode cache (%s) for %llu tensors in %.3fs\n",
+                phase && phase[0] ? phase : "startup",
+                (unsigned long long)q4q8_count,
+                now_sec() - q4_t0);
+    }
+    return true;
+}
+
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
@@ -1511,30 +1552,9 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
         getenv("DS4_CUDA_Q4_Q8_DECODE") != NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4_GENERIC") == NULL &&
-        getenv("DS4_CUDA_NO_Q4_PRELOAD") == NULL) {
-        const double q4_t0 = now_sec();
-        uint64_t q4q8_count = 0;
-        for (uint64_t i = 0; i < m->n_tensors; i++) {
-            const ds4_tensor *t = &m->tensors[i];
-            if (t->bytes == 0 || t->ndim != 2 || t->type != DS4_TENSOR_Q8_0) continue;
-            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
-            char name[128];
-            snprintf(name, sizeof(name), "%.*s", (int)t->name.len, t->name.ptr);
-            if (!accelerator_cuda_q4_from_q8_preload_tensor_name(name)) continue;
-            if (!accelerator_cuda_q4_from_q8_filter_match(name)) continue;
-            char label[160];
-            snprintf(label, sizeof(label), "q4q8:%s", name);
-            if (ds4_gpu_cache_q4_0_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
-                fprintf(stderr, "ds4: accelerator failed to cache Q4-from-Q8 tensor %s\n", name);
-                return false;
-            }
-            q4q8_count++;
-        }
-        if (q4q8_count != 0) {
-            fprintf(stderr, "ds4: CUDA preloaded Q4-from-Q8 decode cache for %llu tensors in %.3fs\n",
-                    (unsigned long long)q4q8_count,
-                    now_sec() - q4_t0);
-        }
+        getenv("DS4_CUDA_NO_Q4_PRELOAD") == NULL &&
+        getenv("DS4_CUDA_Q4_Q8_AFTER_PREFILL") == NULL) {
+        if (!accelerator_cuda_preload_q4_from_q8_model_tensors(m, "startup")) return false;
     }
     if (getenv("DS4_CUDA_Q4_DECODE") != NULL &&
         getenv("DS4_CUDA_F16_NO_Q4") == NULL &&
@@ -1574,8 +1594,23 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     }
     return true;
 }
+
+static bool accelerator_cuda_prepare_decode_caches_after_prefill(ds4_backend backend, const ds4_model *m) {
+    if (backend != DS4_BACKEND_CUDA) return true;
+    if (getenv("DS4_CUDA_Q4_Q8_AFTER_PREFILL") == NULL) return true;
+    if (!accelerator_cuda_q4_from_q8_preload_enabled()) return true;
+
+    ds4_gpu_release_q8_f16_cache();
+    return accelerator_cuda_preload_q4_from_q8_model_tensors(m, "after prefill");
+}
 #else
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+    (void)backend;
+    (void)m;
+    return true;
+}
+
+static bool accelerator_cuda_prepare_decode_caches_after_prefill(ds4_backend backend, const ds4_model *m) {
     (void)backend;
     (void)m;
     return true;
@@ -15566,6 +15601,7 @@ static int generate_metal_graph_raw_swa(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
         const ds4_weights * weights,
+        ds4_backend         backend,
         const token_vec   * prompt,
         int                 n_predict,
         int                 ctx_size,
@@ -15621,7 +15657,6 @@ static int generate_metal_graph_raw_swa(
     } else {
         ok = metal_graph_prefill_raw_swa(&g, model, weights, prompt, prompt->len, logits, true);
     }
-    const double t_prefill1 = now_sec();
     if (memory_report) ds4_gpu_print_memory_report("after prefill");
 
     if (!ok) {
@@ -15629,6 +15664,13 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
+    if (!accelerator_cuda_prepare_decode_caches_after_prefill(backend, model)) {
+        fprintf(stderr, "ds4: failed to prepare CUDA decode caches after prefill\n");
+        free(logits);
+        metal_graph_free(&g);
+        return 1;
+    }
+    const double t_prefill1 = now_sec();
     const char *dump_prefill_logits = getenv("DS4_METAL_DUMP_PREFILL_LOGITS");
     if (dump_prefill_logits && dump_prefill_logits[0]) {
         if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
@@ -17068,7 +17110,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
+        return generate_metal_graph_raw_swa(model, vocab, weights, e->backend, prompt,
                                             n_predict, ctx_size, e->quality,
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
@@ -17615,6 +17657,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             ds4_tokens_copy(&s->checkpoint, prompt);
             s->checkpoint_valid = true;
+            if (!accelerator_cuda_prepare_decode_caches_after_prefill(e->backend, &e->model)) {
+                snprintf(err, errlen, "%s failed to prepare decode caches after resumed prefill", backend_name);
+                s->checkpoint_valid = false;
+                return 1;
+            }
             return 0;
         }
 
@@ -17659,6 +17706,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->graph.mtp_n_raw = 0;
+    if (!accelerator_cuda_prepare_decode_caches_after_prefill(e->backend, &e->model)) {
+        snprintf(err, errlen, "%s failed to prepare decode caches after prefill", backend_name);
+        s->checkpoint_valid = false;
+        return 1;
+    }
     return 0;
 #endif
 }
