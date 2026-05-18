@@ -212,6 +212,7 @@ Q8-derived Q4 follow-up:
   - Reusable phase-switch validation: `~/ds4/codex-runs/20260518-154546-q8-q4-phase-switch`.
   - Q4 correctness isolation: `~/ds4/codex-runs/20260518-155701-q8-q4-correctness`, `~/ds4/codex-runs/20260518-160145-q4-logprob-isolation`, `~/ds4/codex-runs/20260518-160703-q4-f16-hc-filter-isolation`, and `~/ds4/codex-runs/20260518-161559-q8-q4-after-no-f16`.
   - Post-Q4 Nsight profiles: `~/ds4/codex-runs/20260518-162141-q4-fast-ctx32768-nsys` and `~/ds4/codex-runs/20260518-163423-q4-fast-ctx32768-decode-nsys2`.
+  - Decode-only profiler harness validation: `~/ds4/codex-runs/20260518-182636-decode-profile-harness3` and build/test gate `~/ds4/codex-runs/20260518-182730-decode-profile-harness-verify`.
 
 `ctx=4096`, `gen_tokens=512`, all with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` and `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`:
 
@@ -290,6 +291,10 @@ Post-Q4 profiling note:
 - The first `ctx=32768` Nsight run included full prefill, so it is prefill-heavy and not useful as a decode-only ranking.
 - The tighter delayed profile still caught some prefill tail, but it confirms the Q4 cache kernels themselves are not the next bottleneck. Q4 decode kernels such as `grouped_q4_0_a_fused_quant_warp8_kernel`, `matmul_q4_0_preq_warp8_kernel`, and `matmul_q4_0_hc_expand_preq_warp8_kernel` are small relative to the remaining mixed q8, attention, indexer, f16, and MoE buckets.
 - Decode-visible remaining targets after Q4 are still indexed attention, dense attention, indexer score/top-k, MoE gate/up, q8 matvecs, f16 matvecs, and launch fragmentation. Do not keep expanding Q4 blindly without a specific measured bucket.
+- `bf8cc9d`/`fdf471d` add a cleaner profiling harness to `ds4-bench`: `--decode-warmup-tokens N` runs unmeasured decode before the timed window, and `--cuda-profile-decode` brackets only the timed decode with CUDA profiler start/stop for `nsys --capture-range=cudaProfilerApi --capture-range-end=stop`.
+- Clean decode-only capture, fast experimental Q4 preset, `ctx=4096`, `16` warmup tokens, `128` timed decode tokens: `562.18` prefill t/s and `50.44` gen t/s. Top GPU kernel buckets in the timed decode window were `attention_indexed_mixed_kernel` `20.1%`, `moe_gate_up_mid_decode_lut_hwarp16_kernel` `12.1%`, `matmul_f16_kernel` `9.4%`, `matmul_q8_0_preq_warp8_kernel` `7.1%`, `attention_decode_mixed_kernel` `6.8%`, and `rms_norm_plain_kernel` `6.6%`. The three visible Q4 kernels together were about `10.7%`.
+- The clean capture reported `229,520` CUDA kernel launches for `128` timed tokens, about `1,793` launches/token. `cudaLaunchKernel` host time alone was `744.6 ms` across the timed window, or about `5.8 ms/token`; `cudaDeviceSynchronize` time is mostly GPU wait, not pure overhead. This makes launch reduction/CUDA Graph replay a real target, but not the only target.
+- Default `make test CUDA_ARCH=sm_120` after the harness patch preserved the known failure shape: `long-context`, `tool-call-quality`, `metal-kernels`, and `server` OK; `logprob-vectors / long_memory_archive` still has the known `7` failures.
 
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
@@ -723,6 +728,7 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - A 128-slot update cache completed `ctx=4096, gen=256`: `instantiated=128 updated=128 launched=256 failed=0`.
    - It is not a speed patch as written: same-length control was 46.18 tok/s, while the 128-slot capture/update probe was 42.00 tok/s because it still captures/updates every token.
    - Post-topk8704 Nsight captured about `4.0M` kernel launches in a delayed decode window. The profile is still dominated by real GPU work, but launch count is high enough that CUDA Graph replay remains a serious track.
+   - New decode-only profiler harness removes the prefill contamination from the ranking. It still shows about `1,793` kernel launches/token at `ctx=4096`, and `cudaLaunchKernel` host time alone is roughly `5.8 ms/token`.
    - Useful conclusion: CUDA Graph replay remains plausible only with a proper 128-phase graph cache plus direct node parameter updates/static device parameter buffers. The capture/update probe itself should not be merged, and the next graph attempt should not recapture/update every token.
 
 4. **Benchmark calibration against external references**
