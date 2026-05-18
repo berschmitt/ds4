@@ -1511,7 +1511,6 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
         getenv("DS4_CUDA_Q4_Q8_DECODE") != NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4_GENERIC") == NULL &&
-        getenv("DS4_CUDA_Q8_NO_Q4_SINGLE") == NULL &&
         getenv("DS4_CUDA_NO_Q4_PRELOAD") == NULL) {
         const double q4_t0 = now_sec();
         uint64_t q4q8_count = 0;
