@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cublas_v2.h>
@@ -1781,6 +1782,14 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+extern "C" int ds4_gpu_profiler_start(void) {
+    if (!cuda_ok(cudaDeviceSynchronize(), "profiler pre-start synchronize")) return 0;
+    return cuda_ok(cudaProfilerStart(), "profiler start");
+}
+extern "C" int ds4_gpu_profiler_stop(void) {
+    if (!cuda_ok(cudaDeviceSynchronize(), "profiler pre-stop synchronize")) return 0;
+    return cuda_ok(cudaProfilerStop(), "profiler stop");
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;

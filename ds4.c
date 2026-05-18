@@ -15850,6 +15850,24 @@ const char *ds4_backend_name(ds4_backend backend) {
     return "unknown";
 }
 
+int ds4_accelerator_profiler_start(ds4_backend backend) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (backend == DS4_BACKEND_CUDA) return ds4_gpu_profiler_start();
+#else
+    (void)backend;
+#endif
+    return 0;
+}
+
+int ds4_accelerator_profiler_stop(ds4_backend backend) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (backend == DS4_BACKEND_CUDA) return ds4_gpu_profiler_stop();
+#else
+    (void)backend;
+#endif
+    return 0;
+}
+
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
     return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
 }

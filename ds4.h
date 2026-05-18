@@ -102,6 +102,8 @@ const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
+int ds4_accelerator_profiler_start(ds4_backend backend);
+int ds4_accelerator_profiler_stop(ds4_backend backend);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,

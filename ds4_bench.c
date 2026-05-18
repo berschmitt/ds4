@@ -33,9 +33,11 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int decode_warmup_tokens;
     double step_mul;
     bool warm_weights;
     bool quality;
+    bool cuda_profile_decode;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -72,10 +74,16 @@ static void usage(FILE *fp) {
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
         "  --ctx-max N            Last measured frontier. Default: 32768\n"
-        "  --ctx-alloc N          Allocated context. Default: ctx-max + gen-tokens + 1\n"
+        "  --ctx-alloc N          Allocated context. Default: ctx-max + warmup + gen + 1\n"
         "  --step-mul F           Multiplicative step. Default: 1\n"
         "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
         "  --gen-tokens N         Greedy decode tokens per frontier. Default: 128\n"
+        "  --decode-warmup-tokens N\n"
+        "      Run N unmeasured greedy decode tokens before the timed decode window.\n"
+        "      Useful for warm decode profiling. Default: 0\n"
+        "  --cuda-profile-decode\n"
+        "      Bracket only the timed decode window with CUDA profiler start/stop.\n"
+        "      Use with nsys --capture-range=cudaProfilerApi for decode-only traces.\n"
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
@@ -86,6 +94,16 @@ static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT_MAX) {
+        fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static int parse_nonnegative_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
         fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
@@ -205,6 +223,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--decode-warmup-tokens")) {
+            c.decode_warmup_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cuda-profile-decode")) {
+            c.cuda_profile_decode = true;
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -244,13 +266,17 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --step-incr must be positive when --step-mul is 1\n");
         exit(2);
     }
-    if (c.ctx_max > INT_MAX - c.gen_tokens - 1) {
+    const long long required_ctx = (long long)c.ctx_max +
+                                   (long long)c.decode_warmup_tokens +
+                                   (long long)c.gen_tokens +
+                                   1ll;
+    if (required_ctx > INT_MAX) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
         exit(2);
     }
-    if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
-    if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
-        fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+    if (c.ctx_alloc == 0) c.ctx_alloc = (int)required_ctx;
+    if ((long long)c.ctx_alloc < required_ctx) {
+        fprintf(stderr, "ds4-bench: --ctx-alloc must cover ctx-max + decode-warmup-tokens + gen-tokens + 1\n");
         exit(2);
     }
     return c;
@@ -283,6 +309,42 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+static int bench_decode_greedy(
+        ds4_session *session,
+        int          n_tokens,
+        int          eos,
+        int          frontier,
+        const char  *phase,
+        char        *err,
+        size_t       errlen) {
+    for (int i = 0; i < n_tokens; i++) {
+        if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
+            fprintf(stderr,
+                    "ds4-bench: %s would exceed allocated context at frontier %d\n",
+                    phase,
+                    frontier);
+            return 1;
+        }
+        const int token = ds4_session_argmax_excluding(session, eos);
+        if (token < 0) {
+            fprintf(stderr,
+                    "ds4-bench: failed to choose non-EOS token for %s at frontier %d\n",
+                    phase,
+                    frontier);
+            return 1;
+        }
+        if (ds4_session_eval(session, token, err, errlen) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: %s decode at frontier %d failed: %s\n",
+                    phase,
+                    frontier,
+                    err);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
     log_context_memory(cfg.backend, cfg.ctx_alloc);
@@ -296,6 +358,15 @@ int main(int argc, char **argv) {
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
+    if (cfg.decode_warmup_tokens > 0) {
+        fprintf(stderr,
+                "ds4-bench: timed decode window uses %d warmup token(s) before measurement\n",
+                cfg.decode_warmup_tokens);
+    }
+    if (cfg.cuda_profile_decode) {
+        fprintf(stderr,
+                "ds4-bench: CUDA profiler API will bracket each timed decode window\n");
+    }
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
@@ -367,26 +438,44 @@ int main(int argc, char **argv) {
             break;
         }
 
+        if (bench_decode_greedy(session,
+                                cfg.decode_warmup_tokens,
+                                eos,
+                                frontier,
+                                "decode warmup",
+                                err,
+                                sizeof(err)) != 0) {
+            rc = 1;
+            break;
+        }
+
+        bool profiler_started = false;
+        if (cfg.cuda_profile_decode) {
+            if (ds4_accelerator_profiler_start(cfg.backend) != 0) {
+                fprintf(stderr, "ds4-bench: failed to start accelerator profiler at frontier %d\n", frontier);
+                rc = 1;
+                break;
+            }
+            profiler_started = true;
+        }
+
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
-            if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
-                fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
-                rc = 1;
-                break;
-            }
-            const int token = ds4_session_argmax_excluding(session, eos);
-            if (token < 0) {
-                fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
-                rc = 1;
-                break;
-            }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
-            }
+        if (bench_decode_greedy(session,
+                                cfg.gen_tokens,
+                                eos,
+                                frontier,
+                                "generation",
+                                err,
+                                sizeof(err)) != 0) {
+            rc = 1;
         }
         const double gen_t1 = bench_now_sec();
+
+        if (profiler_started &&
+            ds4_accelerator_profiler_stop(cfg.backend) != 0) {
+            fprintf(stderr, "ds4-bench: failed to stop accelerator profiler at frontier %d\n", frontier);
+            rc = 1;
+        }
         if (rc != 0) break;
 
         if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
