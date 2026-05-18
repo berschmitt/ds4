@@ -142,6 +142,7 @@ Selective F16-derived Q4 port:
 - Lazy-allocation probe: `~/ds4/codex-runs/20260518-073000-q4-f16-lazy-probe`.
 - Subset scan: `~/ds4/codex-runs/20260518-073502-q4-f16-subset-scan`.
 - Long-context subset validation: `~/ds4/codex-runs/20260518-074105-q4-f16-subset-long`.
+- Adoption-style repeat: `~/ds4/codex-runs/20260518-075133-q4-f16-adoption-repeat`.
 
 All numbers below used `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` and `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1` on the RTX Pro 6000.
 
@@ -177,7 +178,17 @@ DS4_CUDA_Q4_F16_CACHE_ONLY=1 \
 DS4_CUDA_Q4_F16_FILTER=hc_
 ```
 
-This is not ready as a default. It must still pass smoke plus the known correctness-gate shape, and we need at least one repeat run at `ctx=32768` / 512 generated tokens before considering adoption. The broader all-F16-Q4 policy is useful for decode benchmarking, but it explicitly trades away too much prefill to be the default RTX Pro 6000 setting.
+This is not ready as a default. It must still pass smoke plus the known correctness-gate shape. The broader all-F16-Q4 policy is useful for decode benchmarking, but it explicitly trades away too much prefill to be the default RTX Pro 6000 setting.
+
+Repeat at `ctx=32768`, `gen_tokens=512` confirmed the ranking:
+
+| F16 Q4 policy | Q4 cache | Prefill t/s | Gen t/s | Notes |
+| --- | ---: | ---: | ---: | --- |
+| baseline | 0 | 508.37 | 42.66 | no Q4 |
+| `hc_` | 0.02 GiB | 496.09 | 45.43 | `+6.5%` gen, `-2.4%` prefill |
+| all F16 Q4 | 0.30 GiB | 474.03 | 47.37 | `+11.0%` gen, `-6.8%` prefill |
+
+This makes `hc_` the only plausible near-term preset. It is not a huge win, but it is the first selective Q4 result that moves generation without giving away the whole prefill cache.
 
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
