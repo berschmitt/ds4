@@ -132,6 +132,53 @@ Observed on RTX Pro 6000:
 
 Interpretation: Q4 decode cache is the first external idea that produced a material generation win on this card: about `+11%` in the `ctx=32768` long bench. However, the full Q4 preload does not coexist with the q8->f16 prefill cache on a 96 GB card, so the exact branch trades away a large prefill win. Treat this as a design reference, not a merge candidate. The component scan says the first useful port target is F16-derived decode matvecs, not attention output. After that, generic single Q8->Q4 matters more than Q4 pair; attention-output and HC-expand are real but smaller.
 
+Selective F16-derived Q4 port:
+
+- Branch: `codex/q4-f16-decode`.
+- Commits:
+  - `9109322`: opt-in F16->Q4 decode cache and dispatch.
+  - `c885036`: subset controls via `DS4_CUDA_Q4_F16_FILTER` and `DS4_CUDA_Q4_F16_CACHE_ONLY=1`.
+- Build/smoke/bench run: `~/ds4/codex-runs/20260518-072457-q4-f16-decode-stage1`.
+- Lazy-allocation probe: `~/ds4/codex-runs/20260518-073000-q4-f16-lazy-probe`.
+- Subset scan: `~/ds4/codex-runs/20260518-073502-q4-f16-subset-scan`.
+- Long-context subset validation: `~/ds4/codex-runs/20260518-074105-q4-f16-subset-long`.
+
+All numbers below used `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` and `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1` on the RTX Pro 6000.
+
+At `ctx=4096`, `gen_tokens=512`:
+
+| F16 Q4 policy | Q4 cache | Prefill t/s | Gen t/s | Notes |
+| --- | ---: | ---: | ---: | --- |
+| baseline | 0 | 567.93 | 45.81 | no Q4 |
+| all F16 Q4 | 0.30 GiB | 536.44 | 51.01 | biggest decode gain, clear prefill cost |
+| `hc_` | 0.02 GiB | 559.62 | 48.66 | best cheap decode win |
+| `hc_,ffn_gate_inp` | 0.04 GiB | 551.58 | 49.04 | small extra decode, more prefill loss |
+| `hc_,compressor` | 0.18 GiB | 538.58 | 50.04 | halfway to all-Q4, but prefill cost approaches all-Q4 |
+
+At `ctx=32768`, `gen_tokens=256`:
+
+| F16 Q4 policy | Q4 cache | Prefill t/s | Gen t/s | Notes |
+| --- | ---: | ---: | ---: | --- |
+| baseline | 0 | 506.35 | 42.86 | no Q4 |
+| all F16 Q4 | 0.30 GiB | 472.92 | 47.50 | `+10.8%` gen, `-6.6%` prefill |
+| `hc_` | 0.02 GiB | 495.31 | 45.59 | `+6.4%` gen, `-2.2%` prefill |
+| `hc_,ffn_gate_inp` | 0.04 GiB | 493.24 | 45.70 | tiny gain over `hc_`, slightly more prefill loss |
+| `hc_,compressor` | 0.18 GiB | 479.75 | 46.54 | middle ground, but not as efficient as `hc_` |
+
+Lazy Q4 allocation without startup preload is not a good policy on this 96 GB card. It preserves most prefill (`502.36` t/s at `ctx=32768`) but most F16->Q4 allocations fail during decode after the q8->f16 cache fills VRAM, and generation only reaches `44.06` t/s. This confirms the issue is explicit memory scheduling, not just kernel choice.
+
+Current interpretation: F16-derived Q4 is worth keeping as an opt-in experiment. The best-balanced preset is:
+
+```bash
+DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128 \
+DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1 \
+DS4_CUDA_Q4_DECODE=1 \
+DS4_CUDA_Q4_F16_CACHE_ONLY=1 \
+DS4_CUDA_Q4_F16_FILTER=hc_
+```
+
+This is not ready as a default. It must still pass smoke plus the known correctness-gate shape, and we need at least one repeat run at `ctx=32768` / 512 generated tokens before considering adoption. The broader all-F16-Q4 policy is useful for decode benchmarking, but it explicitly trades away too much prefill to be the default RTX Pro 6000 setting.
+
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
 - Run: `~/ds4/codex-runs/20260517-043821-sync-baseline`
@@ -538,10 +585,11 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Do not port the branch wholesale. It is large, includes server batching and CUDA Graph scaffolding, and has warning-prone speculative-prefix code.
    - Do not use the full preload policy directly. Full Q4 preload (`3.55 GiB`) plus q8->f16 cache does not fit cleanly on this 96 GB card; lowering the q8->f16 reserve to `768` or `512` MB OOMs, while higher reserves leave q8->f16 effectively empty and lose prefill.
    - First port candidate: Q4 cache for F16-derived decode matvecs. The component scan drops from `47.61` to `40.82` gen t/s when F16-derived Q4 is disabled, making this the largest contributor.
+   - May 18 status: `codex/q4-f16-decode` implements this candidate behind `DS4_CUDA_Q4_DECODE=1`. Full F16-Q4 reaches `47.50` gen t/s at `ctx=32768`, but the best balanced subset is currently `DS4_CUDA_Q4_F16_FILTER=hc_` with `45.59` gen t/s and much lower prefill cost.
    - Second port candidate: generic single Q8->Q4 dispatch. Disabling all generic Q8->Q4 drops to `44.72`; disabling only single Q8->Q4 drops to `45.98`.
    - Third port candidate: `attn_output_a` and fused `attn_output_b`/HC-expand. These are real but smaller (`46.49` and `46.30` when disabled). Q4 pair is effectively neutral in this benchmark.
    - Keep everything behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches so quality/performance can be bisected by tensor family.
-   - Success criterion: preserve most of the `~47.9` gen t/s Q4 gain while recovering part of the q8->f16 prefill cache win. If selective Q4 cannot beat full-Q4/no-F16 on generation or cannot recover prefill, document and stop.
+   - Next gate before adoption: repeat `ctx=32768`, 512-token generation for `hc_` and all-F16-Q4, then run the known correctness gate shape. If the `hc_` subset is stable, consider it an opt-in RTX preset; do not make full F16-Q4 default because it gives up too much prefill.
 
 2. **Logprob-vector parity probe**
    - The Alice long-context failure is resolved on the post-`c9dd949` sync, but `make test CUDA_ARCH=sm_120` still fails `logprob-vectors / long_memory_archive` under the default reserve.
