@@ -201,6 +201,7 @@ Q8-derived Q4 follow-up:
   - `46b66d1`: split Q8 Q4 preload from generic single dispatch so HC/attention output can be isolated.
   - `f7d078c`: opt-in fused `attn_output_a` low-projection Q4 path.
   - `ee8d246`: opt-in after-prefill Q8->Q4 preload mode. This releases the optional q8->f16 prefill cache only after a successful prefill, then builds the selected Q8-derived Q4 decode cache.
+  - `240a5c5`: reusable phase switching. Before a later fresh or long resumed prefill, release only Q8-derived Q4 caches, preserve the small F16-derived Q4 cache, and re-enable q8->f16 if it was disabled by the prior decode phase.
 - All Q8-derived Q4 paths are gated separately by `DS4_CUDA_Q4_Q8_DECODE=1` and are not part of the recommended preset.
 - Runs:
   - Generic single-Q8 subset scan: `~/ds4/codex-runs/20260518-080959-q8-q4-stage2-scan`.
@@ -208,6 +209,7 @@ Q8-derived Q4 follow-up:
   - Attention-output scan: `~/ds4/codex-runs/20260518-082807-q8-q4-attn-output-scan`.
   - After-prefill memory-policy scan: `~/ds4/codex-runs/20260518-083957-q8-q4-after-prefill`.
   - After-prefill repeat plus `ctx=32768`: `~/ds4/codex-runs/20260518-084332-q8-q4-after-prefill-repeat`.
+  - Reusable phase-switch validation: `~/ds4/codex-runs/20260518-154546-q8-q4-phase-switch`.
 
 `ctx=4096`, `gen_tokens=512`, all with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` and `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`:
 
@@ -260,7 +262,14 @@ Single `ctx=32768`, `gen_tokens=512` validation:
 | F16 `hc_` | 493.39 | 45.43 | previous balanced preset |
 | F16 `hc_` + after-prefill Q8 `attn_output_a,b` | 493.13 | 47.26 | `+10.8%` gen vs baseline, essentially flat prefill vs F16 `hc_` |
 
-This should become the next experimental preset, not a default yet. The caveat is phase state: `DS4_CUDA_Q4_Q8_AFTER_PREFILL=1` disables q8->f16 rebuilds after the first prefill, so it is appropriate for one-shot benchmark/prototype runs but may hurt later fresh prefills in a long-lived server process. A production version needs explicit prefill/decode phase ownership before promotion.
+Reusable phase-switch validation:
+
+- `240a5c5` adds the missing prefill-side transition. When `DS4_CUDA_Q4_Q8_AFTER_PREFILL=1` is active, a later fresh or long resumed prefill now releases only Q8-derived Q4 cache, keeps the small F16-derived Q4 cache, and re-enables q8->f16 if it was disabled by the previous decode phase.
+- Verbose validation showed the intended sequence across two `ds4-bench` frontiers: release q8->f16 after first prefill, preload Q8->Q4 for decode, release `1548.00 MiB` of Q8-derived Q4 before the next prefill, re-enable q8->f16, then rebuild Q8->Q4 after that prefill.
+- Clean two-frontier run, `gen_tokens=512`: `ctx=4096` reached `555.64` prefill / `50.74` gen; `ctx=8192` reached `542.16` prefill / `49.24` gen.
+- Single-request check remained strong at `ctx=4096`, `gen_tokens=1024`: `567.53` prefill / `51.21` gen.
+
+This is now safer as an experimental preset for repeated prefills in one process. It is still not a default because server concurrency and many-session cache ownership have not been stress-tested.
 
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
@@ -672,9 +681,10 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Second port candidate result: generic single Q8->Q4 dispatch works technically, but is not a useful preset. The best narrow case (`attn_q_b`) moved generation from `48.73` to `49.97` t/s on top of F16 `hc_`, while prefill fell from `564.72` to `512.78` t/s.
    - Third port candidate result: `attn_output_a` and fused `attn_output_b`/HC-expand Q4 also work technically, but show the same tradeoff. Best combined short-context result reached `50.88` gen t/s, but prefill fell to `468.07` t/s.
    - After-prefill memory policy result: delaying selected Q8->Q4 attention-output preload until after prefill preserves almost all F16 `hc_` prefill while keeping the decode gain. At `ctx=32768`, F16 `hc_` was `493.39` prefill / `45.43` gen, while after-prefill Q8 `attn_output_a,b` was `493.13` prefill / `47.26` gen.
+   - Reusable phase-switch result: later prefills in the same process now release Q8-derived Q4, preserve F16 `hc_` Q4, re-enable q8->f16, and rebuild Q8-derived Q4 after prefill. Clean `ctx=4096,8192` multi-frontier validation kept generation at `50.74` and `49.24` t/s respectively.
    - Q4 pair is still effectively neutral in the external component benchmark and has not been ported locally.
    - Keep everything behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches so quality/performance can be bisected by tensor family.
-   - Current experimental adoption candidate is now F16 `hc_` plus after-prefill Q8 `attn_output_a,b`. Keep it opt-in until phase-state behavior is safe for long-lived server use.
+   - Current experimental adoption candidate is now F16 `hc_` plus after-prefill Q8 `attn_output_a,b`. Keep it opt-in until server concurrency and many-session cache behavior are stress-tested.
 
 2. **Logprob-vector parity probe**
    - The Alice long-context failure is resolved on the post-`c9dd949` sync, but `make test CUDA_ARCH=sm_120` still fails `logprob-vectors / long_memory_archive` under the default reserve.
@@ -748,7 +758,7 @@ Known synced-main CUDA failure shape from `~/ds4/codex-runs/20260517-upstream-sy
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512`: avoids OOM, but changes the logprob-vector failure shape to a `short_code_completion` selected-token mismatch.
 - `DS4_CUDA_NO_Q8_F16_CACHE=1`: same default `long_memory_archive` 7-failure shape.
 
-Current Q4 branch default gate, commit `ee8d246`, run log `~/ds4/codex-runs/20260518-084332-q8-q4-after-prefill-repeat/make-test-default.out`: default `make test CUDA_ARCH=sm_120` preserves the same known shape. `long-context`, `tool-call-quality`, `metal-kernels`, and `server` pass; `logprob-vectors / long_memory_archive` reports the same 7 assertion failures.
+Current Q4 branch default gate, commit `240a5c5`, run log `~/ds4/codex-runs/20260518-154546-q8-q4-phase-switch/make-test-default.out`: default `make test CUDA_ARCH=sm_120` preserves the same known shape. `long-context`, `tool-call-quality`, `metal-kernels`, and `server` pass; `logprob-vectors / long_memory_archive` reports the same 7 assertion failures.
 
 For now, a candidate patch is acceptable only if:
 
