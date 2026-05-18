@@ -754,6 +754,15 @@ static int cuda_q4_q8_decode_allowed(void) {
            getenv("DS4_CUDA_Q8_NO_Q4_SINGLE") == NULL;
 }
 
+static int cuda_q4_q8_hcexp_allowed(void) {
+    return cuda_q8_use_dp4a() &&
+           getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q4_Q8_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4_GENERIC") == NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4_HCEXP") == NULL;
+}
+
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
         getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
@@ -2368,6 +2377,53 @@ __global__ static void matmul_q4_0_pair_preq_warp8_kernel(
     if (lane == 0) {
         if (row < out0_dim) out0[row] = acc0;
         if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
+__global__ static void matmul_q4_0_hc_expand_preq_warp8_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint64_t blocks,
+        int has_add) {
+    (void)in_dim;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const __half *scales_row = (const __half *)(w + row * blocks * 18u);
+    const unsigned char *packed_row = w + row * blocks * 18u + blocks * 2u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        float scale = __half2float(scales_row[b]);
+        int32_t dot = q4_block_dot(packed_row + b * 16u, xq + b * 32u);
+        acc += scale * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        const uint32_t d = (uint32_t)row;
+        block_out[d] = acc;
+        float block_v = acc;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
     }
 }
 
@@ -6519,6 +6575,30 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const int use_dp4a = cuda_q8_use_dp4a();
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    if (cuda_q4_q8_hcexp_allowed()) {
+        const int allow_q4_build = getenv("DS4_CUDA_Q4_Q8_CACHE_ONLY") == NULL;
+        const unsigned char *w_q4 = cuda_q4_from_q8_ptr(model_map, weight_offset,
+                                                        weight_bytes, in_dim, out_dim,
+                                                        allow_q4_build);
+        if (w_q4) {
+            matmul_q4_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                    (float *)out_hc->ptr,
+                    (float *)block_out->ptr,
+                    block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                    (const float *)residual_hc->ptr,
+                    (const float *)split->ptr,
+                    w_q4,
+                    xq,
+                    xscale,
+                    in_dim,
+                    out_dim,
+                    n_embd,
+                    n_hc,
+                    blocks,
+                    block_add ? 1 : 0);
+            return cuda_ok(cudaGetLastError(), "matmul_q4_0_hc_expand launch");
+        }
+    }
     matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
