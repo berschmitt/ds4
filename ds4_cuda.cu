@@ -7187,7 +7187,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
+    const int indexed_single_heads8 =
+        n_tokens == 1u && getenv("DS4_CUDA_INDEXED_SINGLE_HEADS8") != NULL;
+    if ((n_tokens > 1u || indexed_single_heads8) && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
