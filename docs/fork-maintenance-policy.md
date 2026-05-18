@@ -36,6 +36,7 @@ Use these tiers when deciding what belongs on the active fork branch.
 | Bare-metal deployment / remote access docs | Keep local | Operationally important for this home-lab host; not intended as upstreamable code. |
 | Broader rejected top-k/indexer shortcuts | Historical only | Narrow `8704` is now adopted after post-`c9dd949` retest. Broader/tail/chunk variants still need a non-perturbing comparison harness before adoption. |
 | Existing grouped-head indexed attention for single-token decode | Drop | May 18 opt-in retest on branch `codex/indexed-attn-single-token-heads8` regressed generation (`40.83` vs `42.64` gen t/s). Do not replay this patch; a future attention win needs a purpose-built one-token kernel or a broader redesign. |
+| CUDA Graph capture/update probes | Historical only | May 18 stability probes prove capture/replay is API-viable, but the decode topology changes across context/frontier state and per-token capture/update is slower. Do not carry probe code as an active patch; revisit only after staticizing the decode launch topology. |
 
 ## Upstream sync workflow
 
