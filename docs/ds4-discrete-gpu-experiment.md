@@ -289,6 +289,16 @@ Operational note: future fallback-disabling probes should use shorter generation
   - Base: average `42.64` gen t/s over 3 runs.
   - `DS4_CUDA_INDEXED_SINGLE_HEADS8=1`: average `40.83` gen t/s over 3 runs.
   - Conclusion: the existing grouped indexed-attention kernel is not a drop-in decode win. Its lower block count loses enough parallelism that the generic per-head path remains faster for single-token decode.
+- Broader single-token indexed attention grouping probe, branch `codex/indexed-attn-single-groups`, run `~/ds4/codex-runs/20260518-041314-indexed-attn-single-groups`: build and smoke passed, but all grouped variants regressed at `ctx=32768`, 512 generated tokens.
+  - Base: average `42.67` gen t/s over 3 runs.
+  - `DS4_CUDA_INDEXED_SINGLE_GROUP4=1`: average `36.02` gen t/s.
+  - `DS4_CUDA_INDEXED_SINGLE_GROUP8=1`: average `39.90` gen t/s.
+  - `DS4_CUDA_INDEXED_SINGLE_GROUP16=1`: average `40.82` gen t/s.
+  - Conclusion: reducing KV reloads by grouping heads is not enough; the lost block-level parallelism dominates. Future indexed-attention work needs a new one-token design, not a grouped prefill/batch route.
+- Decode selected-top-k sorting probe, branch `codex/indexed-decode-topk-sort`, run `~/ds4/codex-runs/20260518-044728-indexed-decode-topk-sort`: build and smoke passed, but opt-in sorting of the 512 selected compressed rows during decode did not help.
+  - Base: average `42.69` gen t/s over 3 runs.
+  - `DS4_CUDA_INDEXED_SORT_DECODE_TOPK=1`: average `42.57` gen t/s.
+  - Conclusion: local row-order cleanup inside the existing decode top-k path is not the missing win. The next top-k/indexer work should be a correctness-preserving selection harness or a different algorithmic path, not a small decode sorting pass.
 - q8 decode fallback switches, run `~/ds4/codex-runs/20260515-024932-q8-switch-ab`: all tested switch-offs were worse at `ctx=32768`, 512 generated tokens.
   - Baseline: `512.58` prefill t/s, `40.39` gen t/s.
   - `DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR=1`: `500.76` prefill t/s, `40.10` gen t/s.
@@ -501,7 +511,8 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
 
 5. **Indexed attention / indexer redesign**
    - Highest combined decode target after the post-topk8704 Nsight profile: indexed attention, dense attention, top-k8704, and indexer score/direct kernels.
-   - Built-in fallback toggles and existing grouped-head single-token routing did not help. The May 18 opt-in `DS4_CUDA_INDEXED_SINGLE_HEADS8=1` retest was also slower (`40.83` vs `42.64` gen t/s).
+   - Built-in fallback toggles and existing grouped-head single-token routing did not help. The May 18 grouped-head probes were all slower, with the best grouped variant at `40.82` vs `42.67` gen t/s.
+   - Decode-only sorting of the selected top-k rows was also slightly slower (`42.57` vs `42.69` gen t/s), so do not chase local row-order cleanup as a standalone patch.
    - Post-`c9dd949`, the narrow CUB top-k fast path for `8192 < n_comp <= 8704` is adopted after preserving the current `make test` failure shape.
    - Next useful work here is either a correctness-preserving harness for larger `n_comp` top-k ranges or a purpose-built one-token indexed-attention kernel. Do not reuse the existing grouped prefill/batch kernel as-is; the A/B says it gives up too much parallelism.
 
