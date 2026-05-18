@@ -7178,8 +7178,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
-    if (n_tokens > 1u && top_k == 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+    if (top_k == 512u && getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL &&
+        (n_tokens > 1u || getenv("DS4_CUDA_INDEXED_SORT_DECODE_TOPK") != NULL)) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
