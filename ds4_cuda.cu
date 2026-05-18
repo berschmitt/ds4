@@ -7187,6 +7187,72 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
+    if (n_tokens == 1u && head_dim == 512u && top_k <= 512u &&
+        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+        if (getenv("DS4_CUDA_INDEXED_SINGLE_GROUP4") != NULL) {
+            dim3 grid(1, (n_head + 3u) / 4u, 1);
+            attention_indexed_mixed_heads8_online_kernel<8, 4><<<grid, 128>>>((float *)heads->ptr,
+                                                                              sinks,
+                                                                              (const float *)q->ptr,
+                                                                              (const float *)raw_kv->ptr,
+                                                                              (const float *)comp_kv->ptr,
+                                                                              topk_ptr,
+                                                                              n_tokens,
+                                                                              pos0,
+                                                                              n_raw,
+                                                                              raw_cap,
+                                                                              raw_start,
+                                                                              n_comp,
+                                                                              top_k,
+                                                                              window,
+                                                                              ratio,
+                                                                              n_head,
+                                                                              head_dim);
+            return cuda_ok(cudaGetLastError(), "attention indexed single group4 launch");
+        }
+        if (getenv("DS4_CUDA_INDEXED_SINGLE_GROUP8") != NULL) {
+            dim3 grid(1, (n_head + 7u) / 8u, 1);
+            attention_indexed_mixed_heads8_online_kernel<8, 8><<<grid, 256>>>((float *)heads->ptr,
+                                                                              sinks,
+                                                                              (const float *)q->ptr,
+                                                                              (const float *)raw_kv->ptr,
+                                                                              (const float *)comp_kv->ptr,
+                                                                              topk_ptr,
+                                                                              n_tokens,
+                                                                              pos0,
+                                                                              n_raw,
+                                                                              raw_cap,
+                                                                              raw_start,
+                                                                              n_comp,
+                                                                              top_k,
+                                                                              window,
+                                                                              ratio,
+                                                                              n_head,
+                                                                              head_dim);
+            return cuda_ok(cudaGetLastError(), "attention indexed single group8 launch");
+        }
+        if (getenv("DS4_CUDA_INDEXED_SINGLE_GROUP16") != NULL) {
+            dim3 grid(1, (n_head + 15u) / 16u, 1);
+            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
+                                                                               sinks,
+                                                                               (const float *)q->ptr,
+                                                                               (const float *)raw_kv->ptr,
+                                                                               (const float *)comp_kv->ptr,
+                                                                               topk_ptr,
+                                                                               n_tokens,
+                                                                               pos0,
+                                                                               n_raw,
+                                                                               raw_cap,
+                                                                               raw_start,
+                                                                               n_comp,
+                                                                               top_k,
+                                                                               window,
+                                                                               ratio,
+                                                                               n_head,
+                                                                               head_dim);
+            return cuda_ok(cudaGetLastError(), "attention indexed single group16 launch");
+        }
+    }
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
