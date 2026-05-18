@@ -211,6 +211,7 @@ Q8-derived Q4 follow-up:
   - After-prefill repeat plus `ctx=32768`: `~/ds4/codex-runs/20260518-084332-q8-q4-after-prefill-repeat`.
   - Reusable phase-switch validation: `~/ds4/codex-runs/20260518-154546-q8-q4-phase-switch`.
   - Q4 correctness isolation: `~/ds4/codex-runs/20260518-155701-q8-q4-correctness`, `~/ds4/codex-runs/20260518-160145-q4-logprob-isolation`, `~/ds4/codex-runs/20260518-160703-q4-f16-hc-filter-isolation`, and `~/ds4/codex-runs/20260518-161559-q8-q4-after-no-f16`.
+  - Post-Q4 Nsight profiles: `~/ds4/codex-runs/20260518-162141-q4-fast-ctx32768-nsys` and `~/ds4/codex-runs/20260518-163423-q4-fast-ctx32768-decode-nsys2`.
 
 `ctx=4096`, `gen_tokens=512`, all with `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128` and `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`:
 
@@ -283,6 +284,12 @@ Practical classification:
 
 - **Fast experimental preset:** F16 `hc_` plus after-prefill Q8 `attn_output_a,b`: best decode so far, not logprob-parity preserving.
 - **Cleaner experimental preset:** Q8 `attn_output_a,b` after-prefill with F16 Q4 disabled: smaller decode gain, preserves the current known logprob failure shape.
+
+Post-Q4 profiling note:
+
+- The first `ctx=32768` Nsight run included full prefill, so it is prefill-heavy and not useful as a decode-only ranking.
+- The tighter delayed profile still caught some prefill tail, but it confirms the Q4 cache kernels themselves are not the next bottleneck. Q4 decode kernels such as `grouped_q4_0_a_fused_quant_warp8_kernel`, `matmul_q4_0_preq_warp8_kernel`, and `matmul_q4_0_hc_expand_preq_warp8_kernel` are small relative to the remaining mixed q8, attention, indexer, f16, and MoE buckets.
+- Decode-visible remaining targets after Q4 are still indexed attention, dense attention, indexer score/top-k, MoE gate/up, q8 matvecs, f16 matvecs, and launch fragmentation. Do not keep expanding Q4 blindly without a specific measured bucket.
 
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
@@ -699,6 +706,7 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Q4 pair is still effectively neutral in the external component benchmark and has not been ported locally.
    - Keep everything behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches so quality/performance can be bisected by tensor family.
    - Current experimental adoption candidate is now F16 `hc_` plus after-prefill Q8 `attn_output_a,b`. Keep it opt-in until server concurrency and many-session cache behavior are stress-tested.
+   - Post-Q4 profiling says this Q4 phase is probably mature enough for now. Next speed work should return to CUDA Graph replay/static-buffer launch reduction, indexed attention/indexer, or MoE gate/up rather than more Q4 cache breadth.
 
 2. **Logprob-vector parity probe**
    - The Alice long-context failure is resolved on the post-`c9dd949` sync, but `make test CUDA_ARCH=sm_120` still fails `logprob-vectors / long_memory_archive` under the default reserve.
