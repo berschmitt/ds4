@@ -124,6 +124,11 @@ struct cuda_q8_f32_range {
     float *device_ptr;
 };
 
+enum cuda_q4_source {
+    CUDA_Q4_SOURCE_F16 = 1,
+    CUDA_Q4_SOURCE_Q8 = 2
+};
+
 /* Optional decode-only Q4_0 cache derived from F16 weights.  The split-row
  * layout is per row: fp16 scales for each 32-value block, then packed signed
  * 4-bit weights.  It is intentionally opt-in because it trades precision for
@@ -134,6 +139,7 @@ struct cuda_q4_range {
     uint64_t weight_bytes_src;
     uint64_t in_dim;
     uint64_t out_dim;
+    int source;
     unsigned char *device_ptr;
 };
 
@@ -151,6 +157,7 @@ static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static uint64_t g_q4_bytes;
 static int g_q8_f16_disabled_after_oom;
+static int g_q8_f16_disabled_for_decode_phase;
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
@@ -451,7 +458,7 @@ static const unsigned char *cuda_q4_from_f16_ptr(
         return NULL;
     }
 
-    g_q4_ranges.push_back({model_map, offset, weight_bytes_f16, in_dim, out_dim, dev});
+    g_q4_ranges.push_back({model_map, offset, weight_bytes_f16, in_dim, out_dim, CUDA_Q4_SOURCE_F16, dev});
     g_q4_by_offset[offset] = g_q4_ranges.size() - 1u;
     g_q4_bytes += out_bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -516,7 +523,7 @@ static const unsigned char *cuda_q4_from_q8_ptr(
         return NULL;
     }
 
-    g_q4_ranges.push_back({model_map, offset, weight_bytes_q8, in_dim, out_dim, dev});
+    g_q4_ranges.push_back({model_map, offset, weight_bytes_q8, in_dim, out_dim, CUDA_Q4_SOURCE_Q8, dev});
     g_q4_by_offset[offset] = g_q4_ranges.size() - 1u;
     g_q4_bytes += out_bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -562,6 +569,11 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_bytes = 0;
 }
 
+static uint64_t cuda_q4_range_device_bytes(const cuda_q4_range &r) {
+    const uint64_t blocks_per_row = (r.in_dim + 31u) / 32u;
+    return blocks_per_row * r.out_dim * 18u;
+}
+
 static void cuda_q4_cache_release_all(void) {
     for (const cuda_q4_range &r : g_q4_ranges) {
         (void)cudaFree(r.device_ptr);
@@ -569,6 +581,44 @@ static void cuda_q4_cache_release_all(void) {
     g_q4_ranges.clear();
     g_q4_by_offset.clear();
     g_q4_bytes = 0;
+}
+
+static uint64_t cuda_q4_cache_release_source(int source) {
+    if (g_q4_ranges.empty()) return 0;
+
+    std::vector<cuda_q4_range> kept;
+    kept.reserve(g_q4_ranges.size());
+    uint64_t released = 0;
+    uint64_t kept_bytes = 0;
+    for (const cuda_q4_range &r : g_q4_ranges) {
+        const uint64_t bytes = cuda_q4_range_device_bytes(r);
+        if (r.source == source) {
+            (void)cudaFree(r.device_ptr);
+            released += bytes;
+        } else {
+            kept.push_back(r);
+            kept_bytes += bytes;
+        }
+    }
+
+    g_q4_ranges.swap(kept);
+    g_q4_by_offset.clear();
+    for (size_t i = 0; i < g_q4_ranges.size(); i++) {
+        g_q4_by_offset[g_q4_ranges[i].offset] = i;
+    }
+    g_q4_bytes = kept_bytes;
+
+    if (released != 0 && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+        const char *name = source == CUDA_Q4_SOURCE_Q8 ? "q4-from-q8" :
+                           source == CUDA_Q4_SOURCE_F16 ? "q4-from-f16" :
+                           "q4";
+        fprintf(stderr,
+                "ds4: CUDA released %s cache %.2f MiB (q4 remaining %.2f GiB)\n",
+                name,
+                (double)released / 1048576.0,
+                (double)g_q4_bytes / 1073741824.0);
+    }
+    return released;
 }
 
 static uint64_t cuda_parse_mib_env(const char *name, int *present) {
@@ -690,6 +740,7 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
     g_q8_f16_disabled_after_oom = 1;
+    g_q8_f16_disabled_for_decode_phase = 0;
     if (!g_q8_f16_ranges.empty()) {
         (void)cudaDeviceSynchronize();
         cuda_q8_f16_cache_release_all();
@@ -704,6 +755,7 @@ extern "C" void ds4_gpu_release_q8_f16_cache(void) {
         cuda_q8_f16_cache_release_all();
     }
     g_q8_f16_disabled_after_oom = 1;
+    g_q8_f16_disabled_for_decode_phase = 1;
     g_q8_f16_budget_notice_printed = 0;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
         fprintf(stderr,
@@ -712,6 +764,21 @@ extern "C" void ds4_gpu_release_q8_f16_cache(void) {
                 (double)released / 1073741824.0);
     }
     (void)cudaGetLastError();
+}
+
+extern "C" void ds4_gpu_prepare_q8_f16_prefill_cache(void) {
+    if (!g_q4_ranges.empty()) {
+        (void)cudaDeviceSynchronize();
+        (void)cuda_q4_cache_release_source(CUDA_Q4_SOURCE_Q8);
+    }
+    if (g_q8_f16_disabled_for_decode_phase) {
+        g_q8_f16_disabled_after_oom = 0;
+        g_q8_f16_disabled_for_decode_phase = 0;
+        g_q8_f16_budget_notice_printed = 0;
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+            fprintf(stderr, "ds4: CUDA re-enabled q8 fp16 cache for prefill phase\n");
+        }
+    }
 }
 
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
@@ -1532,6 +1599,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_q8_f16_cache_release_all();
     cuda_q4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_disabled_for_decode_phase = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
@@ -1721,6 +1789,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     cuda_q8_f16_cache_release_all();
     cuda_q4_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_disabled_for_decode_phase = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);

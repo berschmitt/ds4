@@ -1603,6 +1603,15 @@ static bool accelerator_cuda_prepare_decode_caches_after_prefill(ds4_backend bac
     ds4_gpu_release_q8_f16_cache();
     return accelerator_cuda_preload_q4_from_q8_model_tensors(m, "after prefill");
 }
+
+static bool accelerator_cuda_prepare_prefill_caches(ds4_backend backend) {
+    if (backend != DS4_BACKEND_CUDA) return true;
+    if (getenv("DS4_CUDA_Q4_Q8_AFTER_PREFILL") == NULL) return true;
+    if (!accelerator_cuda_q4_from_q8_preload_enabled()) return true;
+
+    ds4_gpu_prepare_q8_f16_prefill_cache();
+    return true;
+}
 #else
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     (void)backend;
@@ -1613,6 +1622,11 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 static bool accelerator_cuda_prepare_decode_caches_after_prefill(ds4_backend backend, const ds4_model *m) {
     (void)backend;
     (void)m;
+    return true;
+}
+
+static bool accelerator_cuda_prepare_prefill_caches(ds4_backend backend) {
+    (void)backend;
     return true;
 }
 #endif
@@ -15652,6 +15666,11 @@ static int generate_metal_graph_raw_swa(
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
+    if (!accelerator_cuda_prepare_prefill_caches(backend)) {
+        free(logits);
+        metal_graph_free(&g);
+        return 1;
+    }
     if (prefill_cap < (uint32_t)prompt->len) {
         ok = metal_graph_prefill_chunked(&g, model, weights, prompt, prompt->len, logits, false, progress, progress_ud);
     } else {
@@ -17631,6 +17650,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+            if (!accelerator_cuda_prepare_prefill_caches(e->backend)) {
+                snprintf(err, errlen, "%s failed to prepare prefill caches", backend_name);
+                return 1;
+            }
             ds4_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
@@ -17681,6 +17704,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 
     bool ok;
+    if (!accelerator_cuda_prepare_prefill_caches(e->backend)) {
+        snprintf(err, errlen, "%s failed to prepare prefill caches", backend_name);
+        return 1;
+    }
     if (s->prefill_cap < (uint32_t)prompt->len) {
         ds4_sync_progress progress = {
             .session = s,
