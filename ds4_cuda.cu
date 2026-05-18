@@ -358,6 +358,45 @@ __global__ static void f16_to_q4_convert_kernel(
     }
 }
 
+__global__ static void q8_to_q4_convert_kernel(
+        unsigned char *dst,
+        const unsigned char *src,
+        uint64_t blocks_per_row,
+        uint64_t total_blocks) {
+    const uint64_t b_global = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b_global >= total_blocks) return;
+    const uint64_t row = b_global / blocks_per_row;
+    const uint64_t b = b_global % blocks_per_row;
+
+    const unsigned char *sblk = src + b_global * 34u;
+    const uint64_t row_base = row * blocks_per_row * 18u;
+    __half *dscale = (__half *)(dst + row_base + b * 2u);
+    unsigned char *dpacked = dst + row_base + blocks_per_row * 2u + b * 16u;
+
+    const __half sh_old = *(const __half *)sblk;
+    const float s_old = __half2float(sh_old);
+    const int8_t *qs = (const int8_t *)(sblk + 2);
+    int max_abs = 0;
+#pragma unroll
+    for (int i = 0; i < 32; i++) {
+        const int v = qs[i];
+        const int a = v < 0 ? -v : v;
+        max_abs = a > max_abs ? a : max_abs;
+    }
+
+    const float s_new = max_abs > 0 ? s_old * (float)max_abs / 7.0f : 0.0f;
+    *dscale = __float2half(s_new);
+    const float inv = max_abs > 0 ? 7.0f / (float)max_abs : 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int q0 = __float2int_rn((float)qs[i * 2 + 0] * inv);
+        int q1 = __float2int_rn((float)qs[i * 2 + 1] * inv);
+        q0 = q0 > 7 ? 7 : (q0 < -7 ? -7 : q0);
+        q1 = q1 > 7 ? 7 : (q1 < -7 ? -7 : q1);
+        dpacked[i] = (unsigned char)((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+    }
+}
+
 static const unsigned char *cuda_q4_from_f16_ptr(
         const void *model_map,
         uint64_t offset,
@@ -417,6 +456,71 @@ static const unsigned char *cuda_q4_from_f16_ptr(
     g_q4_bytes += out_bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA cached q4-from-f16 %.2f MiB (total %.2f GiB)\n",
+                (double)out_bytes / 1048576.0,
+                (double)g_q4_bytes / 1073741824.0);
+    }
+    return dev;
+}
+
+static const unsigned char *cuda_q4_from_q8_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes_q8,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        int allow_build) {
+    auto exact = g_q4_by_offset.find(offset);
+    if (exact != g_q4_by_offset.end()) {
+        const cuda_q4_range &r = g_q4_ranges[exact->second];
+        if (r.host_base == model_map && r.weight_bytes_src == weight_bytes_q8 &&
+            r.in_dim == in_dim && r.out_dim == out_dim) {
+            return r.device_ptr;
+        }
+    }
+    if (!allow_build) return NULL;
+
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes_q8, "q8_0_for_q4");
+    if (!q8) return NULL;
+
+    if (getenv("DS4_CUDA_Q4_Q8_TRACE") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA q4-from-q8 build offset=%llu in_dim=%llu out_dim=%llu bytes=%llu\n",
+                (unsigned long long)offset,
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)weight_bytes_q8);
+    }
+
+    const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
+    const uint64_t total_blocks = blocks_per_row * out_dim;
+    const uint64_t out_bytes = total_blocks * 18u;
+    unsigned char *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q4-from-q8 alloc failed (%.2f MiB): %s\n",
+                (double)out_bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+
+    const uint32_t threads = 256;
+    const uint64_t grid = (total_blocks + threads - 1u) / threads;
+    q8_to_q4_convert_kernel<<<(unsigned)grid, threads>>>(
+            dev, (const unsigned char *)q8, blocks_per_row, total_blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8->q4 convert launch")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    if (!cuda_ok(cudaDeviceSynchronize(), "q8->q4 convert sync")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+
+    g_q4_ranges.push_back({model_map, offset, weight_bytes_q8, in_dim, out_dim, dev});
+    g_q4_by_offset[offset] = g_q4_ranges.size() - 1u;
+    g_q4_bytes += out_bytes;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached q4-from-q8 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q4_bytes / 1073741824.0);
     }
@@ -639,6 +743,15 @@ static int cuda_q4_f16_decode_allowed(void) {
            getenv("DS4_CUDA_Q4_DECODE") != NULL &&
            getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
            getenv("DS4_CUDA_F16_NO_Q4") == NULL;
+}
+
+static int cuda_q4_q8_decode_allowed(void) {
+    return cuda_q8_use_dp4a() &&
+           getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q4_Q8_DECODE") != NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4_GENERIC") == NULL &&
+           getenv("DS4_CUDA_Q8_NO_Q4_SINGLE") == NULL;
 }
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
@@ -1713,6 +1826,15 @@ extern "C" int ds4_gpu_cache_q4_from_f16_range(const void *model_map, uint64_t m
     if (!cuda_q4_f16_decode_allowed()) return 1;
     if (cuda_q4_from_f16_ptr(model_map, offset, bytes, in_dim, out_dim, 1)) return 1;
     fprintf(stderr, "ds4: CUDA q4-from-f16 preload skipped %s\n", label ? label : "f16");
+    return 1;
+}
+
+extern "C" int ds4_gpu_cache_q4_0_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
+    if (!model_map || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    if (!cuda_q4_q8_decode_allowed()) return 1;
+    if (cuda_q4_from_q8_ptr(model_map, offset, bytes, in_dim, out_dim, 1)) return 1;
+    fprintf(stderr, "ds4: CUDA q4-from-q8 preload skipped %s\n", label ? label : "q8_0");
     return 1;
 }
 
@@ -6226,6 +6348,23 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
+        if (cuda_q4_q8_decode_allowed()) {
+            const int allow_q4_build = getenv("DS4_CUDA_Q4_Q8_CACHE_ONLY") == NULL;
+            const unsigned char *w_q4 = cuda_q4_from_q8_ptr(model_map, weight_offset,
+                                                            weight_bytes, in_dim, out_dim,
+                                                            allow_q4_build);
+            if (w_q4) {
+                matmul_q4_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                        (float *)out->ptr,
+                        w_q4,
+                        xq,
+                        xscale,
+                        in_dim,
+                        out_dim,
+                        blocks);
+                return cuda_ok(cudaGetLastError(), "matmul_q4_0 q8 warp launch");
+            }
+        }
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
