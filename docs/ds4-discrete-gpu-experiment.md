@@ -45,6 +45,9 @@ Canonical reference CSVs live in `speed-bench/`:
 - `rtx_pro_6000.csv` - historical low-reserve policy baseline; useful for prefill comparison, not a global default
 - `rtx_pro_6000_official_65536_20260514.csv` - upstream-shaped `ctx=2048..65536` sweep on current `main`
 - `rtx_pro_6000_f16_default_official_65536_20260515.csv` - upstream-shaped sweep with the Blackwell generic f16 default patch
+- `rtx_pro_6000_post_topk8704_default_65536_20260518.csv` - post-topk8704 upstream-shaped sweep with correctness-safe default reserve
+- `rtx_pro_6000_post_topk8704_r128_no_attn_output_65536_20260518.csv` - post-topk8704 sweep with per-run prefill cache knobs
+- `rtx_pro_6000_post_topk8704_focused_32768_gen512_20260518.csv` - post-topk8704 focused generation run at the upstream context shape
 
 ## Current baseline
 
@@ -56,7 +59,7 @@ Command:
   --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128
 ```
 
-Current post-`c9dd949` official-shaped sweeps:
+Pre-topk post-`c9dd949` official-shaped sweeps:
 
 - Run: `~/ds4/codex-runs/20260517-post-c9dd949-bench`
 - Worktree: `~/ds4/codex-worktrees/post-c9dd949-bench-20260517-191237`
@@ -76,6 +79,30 @@ Per-run tuned reserve (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `DS4_CUDA_NO_ATTE
 - `ctx=65536`: 438.34 prefill t/s, 37.81 gen t/s
 
 Interpretation: the tuned cache policy still gives about 32-34% prefill gain in the 65k-max benchmark shape, but generation is unchanged. The gain is smaller than older 32k-max sweeps because the larger max context buffer leaves less free VRAM for q8->fp16 cache.
+
+Current post-topk8704 official-shaped sweeps:
+
+- Run: `~/ds4/codex-runs/20260518-000141-post-topk8704-full-sweep`
+- Code: `main` at `fe56aba`, including adopted CUB `top_k=512` fast path for `8192 < n_comp <= 8704`
+- Default CSV: `speed-bench/rtx_pro_6000_post_topk8704_default_65536_20260518.csv`
+- Tuned CSV: `speed-bench/rtx_pro_6000_post_topk8704_r128_no_attn_output_65536_20260518.csv`
+- Focused CSV: `speed-bench/rtx_pro_6000_post_topk8704_focused_32768_gen512_20260518.csv`
+
+Default reserve:
+
+- `ctx=2048`: 371.34 prefill t/s, 46.78 gen t/s
+- `ctx=32768`: 342.95 prefill t/s, 43.03 gen t/s
+- `ctx=65536`: 328.28 prefill t/s, 37.77 gen t/s
+
+Per-run tuned reserve (`DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128`, `DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1`):
+
+- `ctx=2048`: 489.00 prefill t/s, 46.59 gen t/s
+- `ctx=32768`: 459.18 prefill t/s, 43.07 gen t/s
+- `ctx=65536`: 438.11 prefill t/s, 37.82 gen t/s
+
+Focused `ctx=32768`, `gen_tokens=512`, tuned reserve: 493.76 prefill t/s, 42.61 gen t/s.
+
+Interpretation: the adopted topk8704 patch moved the upstream-shape generation baseline from about `40.6` to about `43.0` t/s at `ctx=32768`. The low-reserve cache policy still matters for prefill but still does not materially move generation. The generation cliff above `ctx=32768` remains: both default and tuned sweeps drop from about `43` t/s at `32768` to about `40` t/s at `34816`, then decay toward `37.8` t/s at `65536`.
 
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
@@ -214,6 +241,12 @@ Validation status for `5347041`:
   - Result with profiling overhead: `511.03` prefill t/s, `38.04` gen t/s.
   - Decode stage totals: attention `24.73%`, routed MoE `13.89%`, compressor/indexer `12.52%`, attention output `9.97%`, `ffn_hc_pre` + `attn_hc_pre` `18.75%` combined.
   - Next target should be attention or compressor/indexer; PR #145's down path is not on the one-token decode path.
+- Post-adoption delayed Nsight decode profile:
+  - Run: `~/ds4/codex-runs/20260518-001421-post-topk8704-decode-nsys`.
+  - Profile command used `--delay=75 --duration=55` with `ctx=32768`, `gen_tokens=3072`, and the normal per-run prefill knobs.
+  - Bench result under profiling: `504.68` prefill t/s, `41.33` gen t/s.
+  - Largest GPU kernel buckets: generic f16 matvec `16.8%`, indexed attention `16.8%`, dense attention `10.4%`, MoE gate/up decode LUT `10.0%`, HC q8 expansion `6.2%`, q8 matvec `5.9%`, RMS norm `5.4%`, grouped q8 `4.6%`, HC split/norm `4.2%`, q8 pair matvec `4.0%`, MoE down sum6 `3.3%`, topk8704 CUB `2.4%`, indexer direct score `2.4%`.
+  - CUDA API summary still shows extreme launch fragmentation during the capture window: about `4.0M` `cudaLaunchKernel` calls and `4,588` `cudaDeviceSynchronize` calls. This does not mean synchronization is the root cause by itself; it confirms decode is many small GPU kernels plus high launch count.
 
 ## Rejected RTX Pro 6000 probes
 
@@ -248,6 +281,14 @@ Operational note: future fallback-disabling probes should use shorter generation
   - Pair2: `41.10`, `41.07` gen t/s.
   - Default: `42.65`, `42.65` gen t/s.
   - Conclusion: sharing the quantized input/LUT setup across two selected experts loses too much block-level parallelism. Do not carry.
+- Forced ordered one-token f16 matmul on post-topk8704 `main`, run `~/ds4/codex-runs/20260518-002007-f16-ordered-policy-ab`: confirms the Blackwell default should stay generic.
+  - Base: average `42.64` gen t/s over 3 runs.
+  - `DS4_CUDA_USE_ORDERED_F16_MATMUL=1`: average `40.78` gen t/s over 3 runs.
+  - Conclusion: even though generic f16 matvecs remain a large Nsight bucket, the old ordered path is worse on `sm_120`.
+- Opt-in single-token indexed attention through grouped heads8, branch `codex/indexed-attn-single-token-heads8`, run `~/ds4/codex-runs/20260518-003203-indexed-single-heads8-ab`: build passed, but generation regressed.
+  - Base: average `42.64` gen t/s over 3 runs.
+  - `DS4_CUDA_INDEXED_SINGLE_HEADS8=1`: average `40.83` gen t/s over 3 runs.
+  - Conclusion: the existing grouped indexed-attention kernel is not a drop-in decode win. Its lower block count loses enough parallelism that the generic per-head path remains faster for single-token decode.
 - q8 decode fallback switches, run `~/ds4/codex-runs/20260515-024932-q8-switch-ab`: all tested switch-offs were worse at `ctx=32768`, 512 generated tokens.
   - Baseline: `512.58` prefill t/s, `40.39` gen t/s.
   - `DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR=1`: `500.76` prefill t/s, `40.10` gen t/s.
@@ -445,7 +486,8 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Single reusable `cudaGraphExec` failed quickly in earlier testing. A slot cache with 4 or 8 phase slots replayed 127 tokens, then failed on token 128.
    - A 128-slot update cache completed `ctx=4096, gen=256`: `instantiated=128 updated=128 launched=256 failed=0`.
    - It is not a speed patch as written: same-length control was 46.18 tok/s, while the 128-slot capture/update probe was 42.00 tok/s because it still captures/updates every token.
-   - Useful conclusion: CUDA Graph replay remains plausible only with a proper 128-phase graph cache plus direct node parameter updates/static device parameter buffers. The capture/update probe itself should not be merged.
+   - Post-topk8704 Nsight captured about `4.0M` kernel launches in a delayed decode window. The profile is still dominated by real GPU work, but launch count is high enough that CUDA Graph replay remains a serious track.
+   - Useful conclusion: CUDA Graph replay remains plausible only with a proper 128-phase graph cache plus direct node parameter updates/static device parameter buffers. The capture/update probe itself should not be merged, and the next graph attempt should not recapture/update every token.
 
 3. **Benchmark calibration against external references**
    - Run or reproduce an apples-to-apples DS4 server benchmark where possible, especially `llama-benchy`-style steady-state `tg`, because DS4's average generation metric and forum/README metrics are not always the same.
@@ -458,10 +500,10 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Goal: recover safe prefill wins while preserving the default logprob-vector failure shape, with no OOMs.
 
 5. **Indexed attention / indexer redesign**
-   - Highest combined decode target after the patched Nsight profile: indexed attention, dense attention, top-k chunk/merge, and indexer score/direct kernels.
-   - Built-in fallback toggles and single-token grouped-head routing did not help.
+   - Highest combined decode target after the post-topk8704 Nsight profile: indexed attention, dense attention, top-k8704, and indexer score/direct kernels.
+   - Built-in fallback toggles and existing grouped-head single-token routing did not help. The May 18 opt-in `DS4_CUDA_INDEXED_SINGLE_HEADS8=1` retest was also slower (`40.83` vs `42.64` gen t/s).
    - Post-`c9dd949`, the narrow CUB top-k fast path for `8192 < n_comp <= 8704` is adopted after preserving the current `make test` failure shape.
-   - Next useful work here is a correctness-preserving harness for larger `n_comp` ranges. First prove the harness is a no-op by preserving the current `make test` failure shape, then compare selected index/order behavior against the current chunked path before accepting any broader top-k or attention-gather speedup.
+   - Next useful work here is either a correctness-preserving harness for larger `n_comp` top-k ranges or a purpose-built one-token indexed-attention kernel. Do not reuse the existing grouped prefill/batch kernel as-is; the A/B says it gives up too much parallelism.
 
 6. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.

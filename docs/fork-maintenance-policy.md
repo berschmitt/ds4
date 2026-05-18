@@ -26,7 +26,7 @@ Use these tiers when deciding what belongs on the active fork branch.
 
 | Change | Current decision | Why |
 | --- | --- | --- |
-| Blackwell one-token f16 matvec default (`a486c90`) | Keep concept, prefer upstream PR #121 shape | Clear RTX Pro 6000 generation gain. Upstream has the same idea in `upstream-pr/121`, so avoid carrying a divergent interface long term. |
+| Blackwell one-token f16 matvec default (`a486c90`) | Keep concept, prefer upstream PR #121 shape | Clear RTX Pro 6000 generation gain. May 18 retest after topk8704 still shows forced ordered f16 is slower (`40.78` vs `42.64` gen t/s). Upstream has the same idea in `upstream-pr/121`, so avoid carrying a divergent interface long term. |
 | Half-warp MoE decode LUT (`8258aeb`, `da9a129`) | Candidate | Measured repeatable but modest decode gain. Retest after rebasing onto current upstream before keeping. |
 | Pair decode q/kv q8 matvec (`1d35fbb`) | Drop unless retest shows larger value | Small decode gain, touches shared graph/API surface. Not worth carrying by default. |
 | Decode Q head RMS norm + RoPE fusion (`5347041`) | Drop unless part of a larger fusion plan | Small decode gain, touches shared graph/API surface. Keep result documented, but do not replay automatically. |
@@ -35,6 +35,7 @@ Use these tiers when deciding what belongs on the active fork branch.
 | RTX Pro 6000 benchmark CSVs | Keep as historical artifacts | Useful for tracking what happened, but not a runtime policy. |
 | Bare-metal deployment / remote access docs | Keep local | Operationally important for this home-lab host; not intended as upstreamable code. |
 | Broader rejected top-k/indexer shortcuts | Historical only | Narrow `8704` is now adopted after post-`c9dd949` retest. Broader/tail/chunk variants still need a non-perturbing comparison harness before adoption. |
+| Existing grouped-head indexed attention for single-token decode | Drop | May 18 opt-in retest on branch `codex/indexed-attn-single-token-heads8` regressed generation (`40.83` vs `42.64` gen t/s). Do not replay this patch; a future attention win needs a purpose-built one-token kernel or a broader redesign. |
 
 ## Upstream sync workflow
 
