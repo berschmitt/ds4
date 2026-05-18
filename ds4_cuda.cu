@@ -88,6 +88,122 @@ static int g_cublas_ready;
 static int g_cuda_sm_major;
 static int g_quality_mode;
 
+struct cuda_q8_decode_stat {
+    char label[64];
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t calls;
+    double total_ms;
+};
+
+static int g_q8_decode_stats_enabled = -1;
+static int g_q8_decode_stats_registered;
+static cuda_q8_decode_stat g_q8_decode_stats[128];
+static uint32_t g_q8_decode_stats_count;
+
+static void cuda_q8_decode_stats_report(void) {
+    if (g_q8_decode_stats_count == 0) return;
+    fprintf(stderr, "ds4: CUDA q8 decode stats: entries=%u\n", g_q8_decode_stats_count);
+    int emitted[128] = {0};
+    for (uint32_t pass = 0; pass < g_q8_decode_stats_count; pass++) {
+        int best = -1;
+        for (uint32_t i = 0; i < g_q8_decode_stats_count; i++) {
+            if (emitted[i]) continue;
+            if (best < 0 || g_q8_decode_stats[i].total_ms > g_q8_decode_stats[best].total_ms) {
+                best = (int)i;
+            }
+        }
+        if (best < 0) break;
+        emitted[best] = 1;
+        const cuda_q8_decode_stat *s = &g_q8_decode_stats[best];
+        fprintf(stderr,
+                "ds4: CUDA q8 decode stat label=\"%s\" in=%llu out=%llu calls=%llu total=%.3f ms avg=%.6f ms\n",
+                s->label,
+                (unsigned long long)s->in_dim,
+                (unsigned long long)s->out_dim,
+                (unsigned long long)s->calls,
+                s->total_ms,
+                s->calls ? s->total_ms / (double)s->calls : 0.0);
+    }
+}
+
+static int cuda_q8_decode_stats_wanted(void) {
+    if (g_q8_decode_stats_enabled < 0) {
+        g_q8_decode_stats_enabled = getenv("DS4_CUDA_Q8_DECODE_STATS") != NULL;
+        if (g_q8_decode_stats_enabled && !g_q8_decode_stats_registered) {
+            atexit(cuda_q8_decode_stats_report);
+            g_q8_decode_stats_registered = 1;
+        }
+    }
+    return g_q8_decode_stats_enabled;
+}
+
+static void cuda_q8_decode_stats_add(
+        const char *label,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        double ms) {
+    if (!cuda_q8_decode_stats_wanted()) return;
+    if (!label) label = "q8_0";
+    for (uint32_t i = 0; i < g_q8_decode_stats_count; i++) {
+        cuda_q8_decode_stat *s = &g_q8_decode_stats[i];
+        if (s->in_dim == in_dim && s->out_dim == out_dim &&
+            strncmp(s->label, label, sizeof(s->label)) == 0) {
+            s->calls++;
+            s->total_ms += ms;
+            return;
+        }
+    }
+    if (g_q8_decode_stats_count >= (uint32_t)(sizeof(g_q8_decode_stats) / sizeof(g_q8_decode_stats[0]))) {
+        return;
+    }
+    cuda_q8_decode_stat *s = &g_q8_decode_stats[g_q8_decode_stats_count++];
+    snprintf(s->label, sizeof(s->label), "%s", label);
+    s->in_dim = in_dim;
+    s->out_dim = out_dim;
+    s->calls = 1;
+    s->total_ms = ms;
+}
+
+static int cuda_q8_decode_profile_begin(cudaEvent_t *start, cudaEvent_t *stop) {
+    *start = NULL;
+    *stop = NULL;
+    if (!cuda_q8_decode_stats_wanted()) return 0;
+    if (cudaEventCreate(start) != cudaSuccess) return 0;
+    if (cudaEventCreate(stop) != cudaSuccess) {
+        (void)cudaEventDestroy(*start);
+        *start = NULL;
+        return 0;
+    }
+    if (cudaEventRecord(*start, 0) != cudaSuccess) {
+        (void)cudaEventDestroy(*start);
+        (void)cudaEventDestroy(*stop);
+        *start = NULL;
+        *stop = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_q8_decode_profile_finish(
+        const char *label,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        int active,
+        cudaEvent_t start,
+        cudaEvent_t stop) {
+    if (!active || !start || !stop) return;
+    if (cudaEventRecord(stop, 0) == cudaSuccess &&
+        cudaEventSynchronize(stop) == cudaSuccess) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, start, stop) == cudaSuccess) {
+            cuda_q8_decode_stats_add(label, in_dim, out_dim, (double)ms);
+        }
+    }
+    (void)cudaEventDestroy(start);
+    (void)cudaEventDestroy(stop);
+}
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -5983,9 +6099,15 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
+    cudaEvent_t q8_prof_start = NULL;
+    cudaEvent_t q8_prof_stop = NULL;
+    const int q8_profile = (n_tok == 1 && cuda_q8_decode_profile_begin(&q8_prof_start, &q8_prof_stop));
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) {
+        cuda_q8_decode_profile_finish(label, in_dim, out_dim, q8_profile, q8_prof_start, q8_prof_stop);
+        return 0;
+    }
     if (n_tok == 1) {
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
                 (float *)out->ptr,
@@ -5996,7 +6118,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 out_dim,
                 blocks,
                 use_dp4a);
-        return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
+        int q8_ok = cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
+        cuda_q8_decode_profile_finish(label, in_dim, out_dim, q8_profile, q8_prof_start, q8_prof_stop);
+        return q8_ok;
     }
     if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
@@ -6075,9 +6199,16 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
+    cudaEvent_t q8_prof_start = NULL;
+    cudaEvent_t q8_prof_stop = NULL;
+    const int q8_profile = cuda_q8_decode_profile_begin(&q8_prof_start, &q8_prof_stop);
     dim3 qgrid((unsigned)blocks, 1, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) {
+        cuda_q8_decode_profile_finish("q8_pair", in_dim, out0_dim + out1_dim,
+                                      q8_profile, q8_prof_start, q8_prof_stop);
+        return 0;
+    }
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
             (float *)out0->ptr,
@@ -6091,7 +6222,10 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             out1_dim,
             blocks,
             use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
+    int q8_ok = cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
+    cuda_q8_decode_profile_finish("q8_pair", in_dim, out0_dim + out1_dim,
+                                  q8_profile, q8_prof_start, q8_prof_stop);
+    return q8_ok;
 }
 
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
@@ -6139,8 +6273,15 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
+    cudaEvent_t q8_prof_start = NULL;
+    cudaEvent_t q8_prof_stop = NULL;
+    const int q8_profile = cuda_q8_decode_profile_begin(&q8_prof_start, &q8_prof_stop);
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) {
+        cuda_q8_decode_profile_finish(label ? label : "q8_0_hc_expand", in_dim, out_dim,
+                                      q8_profile, q8_prof_start, q8_prof_stop);
+        return 0;
+    }
     matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
@@ -6157,7 +6298,10 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             blocks,
             block_add ? 1 : 0,
             use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
+    int q8_ok = cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
+    cuda_q8_decode_profile_finish(label ? label : "q8_0_hc_expand", in_dim, out_dim,
+                                  q8_profile, q8_prof_start, q8_prof_stop);
+    return q8_ok;
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
