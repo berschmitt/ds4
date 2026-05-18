@@ -111,6 +111,7 @@ External Q4 decode reference branch:
 - Local RTX run: `~/ds4/codex-runs/20260518-055406-ngc-shj-perf-clean-q4-probe`.
 - Follow-up memory-policy run: `~/ds4/codex-runs/20260518-055846-ngc-shj-q4-no-f16-probe`.
 - Reserve scan: `~/ds4/codex-runs/20260518-060219-ngc-shj-q4-reserve-scan`.
+- Component scan: `~/ds4/codex-runs/20260518-061807-ngc-shj-q4-component-scan`.
 
 Observed on RTX Pro 6000:
 
@@ -120,8 +121,16 @@ Observed on RTX Pro 6000:
 - Q4 with `DS4_CUDA_NO_Q8_F16_CACHE=1` fits and smoke generation jumps from about `53.1` t/s to `72.8` t/s on a tiny CLI decode.
 - In the focused `ctx=32768`, `gen_tokens=256` bench, Q4 without q8->f16 cache gives `351.19` prefill t/s and `47.68` gen t/s.
 - In the reserve scan with `gen_tokens=128`, stable Q4 variants cluster around `47.9` gen t/s. Reserves from `1024` to `4096` MB effectively leave q8->f16 cache empty and prefill around `342` t/s; reserves `768` and `512` MB OOM during prefill.
+- Component scan at `ctx=32768`, `gen_tokens=256`:
+  - full Q4: `350.37` prefill t/s, `47.61` gen t/s.
+  - `DS4_CUDA_F16_NO_Q4=1`: `341.93` prefill t/s, `40.82` gen t/s. F16-derived Q4 is the largest contributor.
+  - `DS4_CUDA_Q8_NO_Q4_GENERIC=1`: `341.92` prefill t/s, `44.72` gen t/s.
+  - `DS4_CUDA_Q8_NO_Q4_SINGLE=1`: `341.83` prefill t/s, `45.98` gen t/s.
+  - `DS4_CUDA_Q8_NO_Q4_HCEXP=1`: `342.13` prefill t/s, `46.30` gen t/s.
+  - `DS4_CUDA_Q8_NO_Q4_ATTN_OUT=1`: `342.85` prefill t/s, `46.49` gen t/s.
+  - `DS4_CUDA_Q8_NO_Q4_PAIR=1`: `341.79` prefill t/s, `47.58` gen t/s, effectively neutral.
 
-Interpretation: Q4 decode cache is the first external idea that produced a material generation win on this card: about `+11%` in the `ctx=32768` long bench. However, the full Q4 preload does not coexist with the q8->f16 prefill cache on a 96 GB card, so the exact branch trades away a large prefill win. Treat this as a design reference, not a merge candidate. The likely useful path is selective Q4 decode cache for the highest-value decode tensors, preserving as much q8->f16 prefill cache as possible.
+Interpretation: Q4 decode cache is the first external idea that produced a material generation win on this card: about `+11%` in the `ctx=32768` long bench. However, the full Q4 preload does not coexist with the q8->f16 prefill cache on a 96 GB card, so the exact branch trades away a large prefill win. Treat this as a design reference, not a merge candidate. The component scan says the first useful port target is F16-derived decode matvecs, not attention output. After that, generic single Q8->Q4 matters more than Q4 pair; attention-output and HC-expand are real but smaller.
 
 Previous post-upstream-sync default-policy baseline. This used the synced fork at `89f3a0d` with no low-reserve q8 f16 cache overrides:
 
@@ -528,7 +537,10 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - `ngc-shj/perf-clean` proves Q4 decode can move generation on the RTX Pro 6000: about `47.9` gen t/s at `ctx=32768` vs the current `42-43` t/s band.
    - Do not port the branch wholesale. It is large, includes server batching and CUDA Graph scaffolding, and has warning-prone speculative-prefix code.
    - Do not use the full preload policy directly. Full Q4 preload (`3.55 GiB`) plus q8->f16 cache does not fit cleanly on this 96 GB card; lowering the q8->f16 reserve to `768` or `512` MB OOMs, while higher reserves leave q8->f16 effectively empty and lose prefill.
-   - First port candidate: the Q4 cache format plus opt-in dispatch for the biggest decode buckets identified locally: `attn_output_a`, fused `attn_output_b`/HC-expand, and q-b. Keep it behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches.
+   - First port candidate: Q4 cache for F16-derived decode matvecs. The component scan drops from `47.61` to `40.82` gen t/s when F16-derived Q4 is disabled, making this the largest contributor.
+   - Second port candidate: generic single Q8->Q4 dispatch. Disabling all generic Q8->Q4 drops to `44.72`; disabling only single Q8->Q4 drops to `45.98`.
+   - Third port candidate: `attn_output_a` and fused `attn_output_b`/HC-expand. These are real but smaller (`46.49` and `46.30` when disabled). Q4 pair is effectively neutral in this benchmark.
+   - Keep everything behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches so quality/performance can be bisected by tensor family.
    - Success criterion: preserve most of the `~47.9` gen t/s Q4 gain while recovering part of the q8->f16 prefill cache win. If selective Q4 cannot beat full-Q4/no-F16 on generation or cannot recover prefill, document and stop.
 
 2. **Logprob-vector parity probe**
