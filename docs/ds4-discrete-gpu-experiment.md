@@ -294,6 +294,8 @@ Post-Q4 profiling note:
 - `bf8cc9d`/`fdf471d` add a cleaner profiling harness to `ds4-bench`: `--decode-warmup-tokens N` runs unmeasured decode before the timed window, and `--cuda-profile-decode` brackets only the timed decode with CUDA profiler start/stop for `nsys --capture-range=cudaProfilerApi --capture-range-end=stop`.
 - Clean decode-only capture, fast experimental Q4 preset, `ctx=4096`, `16` warmup tokens, `128` timed decode tokens: `562.18` prefill t/s and `50.44` gen t/s. Top GPU kernel buckets in the timed decode window were `attention_indexed_mixed_kernel` `20.1%`, `moe_gate_up_mid_decode_lut_hwarp16_kernel` `12.1%`, `matmul_f16_kernel` `9.4%`, `matmul_q8_0_preq_warp8_kernel` `7.1%`, `attention_decode_mixed_kernel` `6.8%`, and `rms_norm_plain_kernel` `6.6%`. The three visible Q4 kernels together were about `10.7%`.
 - The clean capture reported `229,520` CUDA kernel launches for `128` timed tokens, about `1,793` launches/token. `cudaLaunchKernel` host time alone was `744.6 ms` across the timed window, or about `5.8 ms/token`; `cudaDeviceSynchronize` time is mostly GPU wait, not pure overhead. This makes launch reduction/CUDA Graph replay a real target, but not the only target.
+- Fresh current-fast-preset delayed Nsight profile, `ctx=32768`, run `~/ds4/codex-runs/20260519-061742-current-fast-decode-nsys`: baseline bench was `511.22` prefill t/s and `47.39` gen t/s. The delayed profile captured about `1,613` decode tokens. Top GPU buckets were indexed attention `19.0%`, dense/window attention `11.5%`, MoE gate/up decode LUT `11.1%`, f16 matvec `8.6%`, q8 matvec `6.5%`, RMS norm `6.1%`, HC split/norm `4.7%`, q8 pair matvec `4.4%`, MoE down sum6 `3.6%`, Q4 attention-output fused path `3.6%`, Q4 matvec `3.4%`, topk8704 `3.1%`, and indexer direct score `2.7%`.
+- The same profile still shows heavy launch fragmentation: `2.89M` `cudaLaunchKernel` calls in the delayed capture, about `1,793` launches/token. CUDA memops were tiny in the capture window: only `16.7 ms` total D2H time. Current decode is mostly real GPU kernel time plus many launches, not host-device transfer.
 - Default `make test CUDA_ARCH=sm_120` after the harness patch preserved the known failure shape: `long-context`, `tool-call-quality`, `metal-kernels`, and `server` OK; `logprob-vectors / long_memory_archive` still has the known `7` failures.
 - Follow-up split-layer sweep with the fast experimental Q4 preset, run `~/ds4/codex-runs/20260518-213220-split-layer-sweep`: `DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS` from default through `0,1,2,4,8,16,32` stayed in a tight `50.86-51.12` gen t/s band at `ctx=4096`, `512` generated tokens. The CUDA mid-token flush is not the missing Q4-era decode win.
 - Q4-era single-token indexed attention through the existing grouped heads8 kernel, run `~/ds4/codex-runs/20260518-143819-heads8-decode`: build passed, but generation regressed (`50.97` control, `48.40` heads8 online, `39.66` heads8 two-pass). This confirms the older pre-Q4 conclusion: grouping heads reduces KV reloads, but the lost single-token block-level parallelism dominates.
@@ -501,6 +503,18 @@ Operational note: future fallback-disabling probes should use shorter generation
   - `DS4_CUDA_INDEXED_SINGLE_GROUP8=1`: average `39.90` gen t/s.
   - `DS4_CUDA_INDEXED_SINGLE_GROUP16=1`: average `40.82` gen t/s.
   - Conclusion: reducing KV reloads by grouping heads is not enough; the lost block-level parallelism dominates. Future indexed-attention work needs a new one-token design, not a grouped prefill/batch route.
+- Current-fast-preset attention/indexer switch scan, run `~/ds4/codex-runs/20260519-062541-current-attention-policy-scan`: no existing fallback switch exposed a generation win.
+  - Base: `508.35` prefill t/s, `47.45` gen t/s.
+  - `DS4_CUDA_NO_WINDOW_ATTENTION=1`: `396.40` prefill t/s, `47.39` gen t/s.
+  - `DS4_CUDA_NO_INDEXED_HEADS8=1`: `405.78` prefill t/s, `47.39` gen t/s.
+  - `DS4_CUDA_NO_INDEXED_TOPK_SORT=1`: `492.28` prefill t/s, `47.40` gen t/s.
+  - `DS4_CUDA_INDEXED_TWOPASS=1`: `475.34` prefill t/s, `47.37` gen t/s.
+  - `DS4_CUDA_NO_TOPK8704=1`: `492.48` prefill t/s, `44.42` gen t/s.
+  - Conclusion: the existing attention fast paths remain the right baseline, and topk8704 is still carrying a material decode win. Attention work needs a new decode kernel shape, not old fallback toggles.
+- Single-token dense/mixed attention warp-dot probe, run `~/ds4/codex-runs/20260519-064000-attention-single-warpdot-ab`: rejected.
+  - Prototype changed `attention_decode_mixed_kernel` so single-token mixed attention with visible compressed rows used the existing warp-parallel score dot path instead of the current serial per-row dot branch.
+  - Smoke passed, but `ctx=32768`, 512 generated tokens regressed badly: patched `43.87` / `43.83` gen t/s vs baseline binary `47.25` / `47.26`.
+  - Conclusion: the current single-token serial score branch is faster for this shape. Do not replay this patch. If dense/window attention remains a target, it needs a different design than simply reusing the batched warp-dot path.
 - Decode selected-top-k sorting probe, branch `codex/indexed-decode-topk-sort`, run `~/ds4/codex-runs/20260518-044728-indexed-decode-topk-sort`: build and smoke passed, but opt-in sorting of the 512 selected compressed rows during decode did not help.
   - Base: average `42.69` gen t/s over 3 runs.
   - `DS4_CUDA_INDEXED_SORT_DECODE_TOPK=1`: average `42.57` gen t/s.
