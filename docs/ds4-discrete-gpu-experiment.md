@@ -398,8 +398,8 @@ Decision rule:
 ## Merged RTX Pro 6000 changes
 
 - `a865750` / related speed-bench commits: low-reserve q8 f16 cache policy and CSV baselines. The policy is now revoked as a correctness default; keep the CSVs as historical probes only.
-- `1d35fbb`: pair decode q and kv q8 matvecs. Small but repeatable decode gain.
-- `5347041`: fuse decode Q head RMS norm and RoPE via existing CUDA helper. Small repeatable decode gain, with `DS4_METAL_DISABLE_Q_HEAD_ROPE_FUSION=1` as the reference fallback.
+- `1d35fbb`: pair decode q and kv q8 matvecs. Historical only after the May 19 clean replay; the active q/kv dispatch was removed because the measured gain was too small to justify carrying it.
+- `5347041`: fuse decode Q head RMS norm and RoPE via existing CUDA helper. Historical only after the May 19 clean replay; the active q-head dispatch was removed for the same reason. The helper symbol may still exist in CUDA code, but the decode graph no longer calls it.
 - `da9a129`: half-warp MoE decode LUT gate/up kernel. Repeatable RTX Pro 6000 decode gain with `DS4_CUDA_MOE_NO_DECODE_LUT_H16=1` as the reference fallback:
   - `ctx=4096`: about 43.8 gen t/s vs 42.6 fallback.
   - `ctx=32768`: about 38.6 gen t/s vs 37.7 fallback.
@@ -411,12 +411,23 @@ Decision rule:
   - `ctx=4096`: 45.90 gen t/s default vs 43.82 old ordered fallback.
   - `ctx=32768`: 40.33 gen t/s default vs 38.59 old ordered fallback.
 
-Validation status for `5347041`:
+Historical validation status for `5347041`:
 
 - CUDA build passed on `sm_120`.
 - Smoke generation passed.
 - `make test CUDA_ARCH=sm_120` has the same known `logprob-vectors / long_memory_archive` 7-failure pattern seen before this patch; no new failure shape observed.
 - Nsight confirms `head_rms_norm_rope_tail_kernel` is active.
+
+Clean replay status:
+
+- Branch: `codex/q4-f16-decode-clean-20260519`, based on `upstream/main` at `c9dd949`.
+- Run: `~/ds4/codex-runs/20260519-153221-clean-sync-validation`.
+- Intent: replay only retained patches and documentation while skipping the two dropped active dispatches above.
+- Build: OK for `CUDA_ARCH=sm_120`.
+- Smoke: OK.
+- `make test CUDA_ARCH=sm_120`: preserves the known default failure shape. `long-context`, `tool-call-quality`, `metal-kernels`, and `server` passed; `logprob-vectors / long_memory_archive` reported the known `7` failures.
+- Fast Q4 preset bench: `ctx=4096` reached `548.25` prefill / `50.44` gen t/s; `ctx=32768` reached `496.87` prefill / `46.88` gen t/s.
+- Interpretation: dropping the two small dispatch experiments costs roughly about one percent in the current fast preset, which is below the carry threshold. The cleaner branch is preferred unless later work shows those dispatches unlock a larger optimization.
 
 ## Adopted RTX Pro 6000 probes
 
@@ -819,7 +830,9 @@ Known synced-main CUDA failure shape from `~/ds4/codex-runs/20260517-upstream-sy
 - `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=512`: avoids OOM, but changes the logprob-vector failure shape to a `short_code_completion` selected-token mismatch.
 - `DS4_CUDA_NO_Q8_F16_CACHE=1`: same default `long_memory_archive` 7-failure shape.
 
-Current Q4 branch default gate, commit `240a5c5`, run log `~/ds4/codex-runs/20260518-154546-q8-q4-phase-switch/make-test-default.out`: default `make test CUDA_ARCH=sm_120` preserves the same known shape. `long-context`, `tool-call-quality`, `metal-kernels`, and `server` pass; `logprob-vectors / long_memory_archive` reports the same 7 assertion failures.
+Current clean Q4 replay branch gate, commit `31cc93f`, run log `~/ds4/codex-runs/20260519-153221-clean-sync-validation`: default `make test CUDA_ARCH=sm_120` preserves the same known shape. `long-context`, `tool-call-quality`, `metal-kernels`, and `server` pass; `logprob-vectors / long_memory_archive` reports the same 7 assertion failures.
+
+Previous Q4 branch default gate, commit `240a5c5`, run log `~/ds4/codex-runs/20260518-154546-q8-q4-phase-switch/make-test-default.out`: same known shape.
 
 For now, a candidate patch is acceptable only if:
 
