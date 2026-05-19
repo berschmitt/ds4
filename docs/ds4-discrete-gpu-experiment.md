@@ -493,6 +493,14 @@ Operational note: future fallback-disabling probes should use shorter generation
   - Base: average `42.64` gen t/s over 3 runs.
   - `DS4_CUDA_USE_ORDERED_F16_MATMUL=1`: average `40.78` gen t/s over 3 runs.
   - Conclusion: even though generic f16 matvecs remain a large Nsight bucket, the old ordered path is worse on `sm_120`.
+- Current-fast-preset matvec policy scan, run `~/ds4/codex-runs/20260519-064838-current-matvec-policy-scan`: no simple f16/q8 switch exposed a new generation win at `ctx=32768`, 256 generated tokens.
+  - Base: `508.39` prefill t/s, `47.47` gen t/s.
+  - `DS4_CUDA_USE_ORDERED_F16_MATMUL=1`: `497.58` prefill t/s, `45.97` gen t/s.
+  - `DS4_CUDA_NO_Q8_DP4A=1`: `325.65` prefill t/s, `41.23` gen t/s.
+  - `DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR=1`: `492.95` prefill t/s, `47.11` gen t/s.
+  - Enabling broader q8->Q4 single matvecs by removing `DS4_CUDA_Q8_NO_Q4_SINGLE=1`: `492.22` prefill t/s, `47.38` gen t/s.
+  - `DS4_CUDA_F16_NO_Q4=1`: `493.01` prefill t/s, `44.42` gen t/s.
+  - Conclusion: the current Blackwell f16/q8 defaults are still the right baseline. Broader q8->Q4 single matvecs do not improve decode enough to justify the prefill cost. Future matvec work needs a new kernel/cache idea, not a switch flip.
 - Opt-in single-token indexed attention through grouped heads8, branch `codex/indexed-attn-single-token-heads8`, run `~/ds4/codex-runs/20260518-003203-indexed-single-heads8-ab`: build passed, but generation regressed.
   - Base: average `42.64` gen t/s over 3 runs.
   - `DS4_CUDA_INDEXED_SINGLE_HEADS8=1`: average `40.83` gen t/s over 3 runs.
