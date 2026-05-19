@@ -5725,6 +5725,76 @@ __global__ static void indexer_topk_8704_cub_kernel(
     }
 }
 
+template <uint32_t ITEMS_PER_THREAD>
+__global__ static void indexer_topk_cub_items_kernel(
+        uint32_t *selected,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k) {
+    constexpr uint32_t BLOCK_THREADS = 512u;
+    using BlockSort = cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    extern __shared__ __align__(16) unsigned char sort_smem[];
+    typename BlockSort::TempStorage &sort_storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(sort_smem);
+
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= BLOCK_THREADS) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    uint64_t keys[ITEMS_PER_THREAD];
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t i = tid * ITEMS_PER_THREAD + item;
+        if (i < n_comp) {
+            keys[item] = topk_pack_key(row[i], i);
+        } else {
+            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+        }
+    }
+
+    BlockSort(sort_storage).SortDescending(keys);
+
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t i = tid * ITEMS_PER_THREAD + item;
+        if (i < top_k) {
+            selected[(uint64_t)t * top_k + i] = 0xffffffffu - (uint32_t)keys[item];
+        }
+    }
+}
+
+template <uint32_t ITEMS_PER_THREAD>
+static int launch_indexer_topk_cub_items(
+        ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k,
+        const char *what) {
+    using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, ITEMS_PER_THREAD>;
+    const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
+    int dev = 0;
+    int max_optin_smem = 0;
+    cudaError_t attr_err = cudaGetDevice(&dev);
+    if (attr_err == cudaSuccess) {
+        attr_err = cudaDeviceGetAttribute(&max_optin_smem,
+                                          cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                          dev);
+    }
+    if (attr_err != cudaSuccess || max_optin_smem < smem) return -1;
+    attr_err = cudaFuncSetAttribute(indexer_topk_cub_items_kernel<ITEMS_PER_THREAD>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    smem);
+    if (attr_err != cudaSuccess) return -1;
+
+    indexer_topk_cub_items_kernel<ITEMS_PER_THREAD><<<n_tokens, 512, (size_t)smem>>>(
+            (uint32_t *)selected->ptr, (const float *)scores->ptr,
+            n_comp, n_tokens, top_k);
+    return cuda_ok(cudaGetLastError(), what);
+}
+
 __global__ static void indexer_topk_1024_kernel(
         uint32_t *selected,
         const float *scores,
@@ -6405,6 +6475,66 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 return cuda_ok(cudaGetLastError(), "indexer topk 8704 cub launch");
             }
         }
+    }
+    if (top_k == 512u && n_comp <= 9216u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8192") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8704") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9216") == NULL) {
+        int rc = launch_indexer_topk_cub_items<18>(
+                selected, scores, n_comp, n_tokens, top_k,
+                "indexer topk 9216 cub launch");
+        if (rc >= 0) return rc;
+    }
+    if (top_k == 512u && n_comp <= 9728u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8192") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8704") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9216") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9728") == NULL) {
+        int rc = launch_indexer_topk_cub_items<19>(
+                selected, scores, n_comp, n_tokens, top_k,
+                "indexer topk 9728 cub launch");
+        if (rc >= 0) return rc;
+    }
+    if (top_k == 512u && n_comp <= 10240u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8192") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8704") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9216") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9728") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK10240") == NULL) {
+        int rc = launch_indexer_topk_cub_items<20>(
+                selected, scores, n_comp, n_tokens, top_k,
+                "indexer topk 10240 cub launch");
+        if (rc >= 0) return rc;
+    }
+    if (top_k == 512u && n_comp <= 11264u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8192") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8704") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9216") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9728") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK10240") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK11264") == NULL) {
+        int rc = launch_indexer_topk_cub_items<22>(
+                selected, scores, n_comp, n_tokens, top_k,
+                "indexer topk 11264 cub launch");
+        if (rc >= 0) return rc;
+    }
+    if (top_k == 512u && n_comp <= 12288u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8192") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8704") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9216") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK9728") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK10240") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK11264") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK12288") == NULL) {
+        int rc = launch_indexer_topk_cub_items<24>(
+                selected, scores, n_comp, n_tokens, top_k,
+                "indexer topk 12288 cub launch");
+        if (rc >= 0) return rc;
     }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {

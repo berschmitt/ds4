@@ -48,6 +48,11 @@ Canonical reference CSVs live in `speed-bench/`:
 - `rtx_pro_6000_post_topk8704_default_65536_20260518.csv` - post-topk8704 upstream-shaped sweep with correctness-safe default reserve
 - `rtx_pro_6000_post_topk8704_r128_no_attn_output_65536_20260518.csv` - post-topk8704 sweep with per-run prefill cache knobs
 - `rtx_pro_6000_post_topk8704_focused_32768_gen512_20260518.csv` - post-topk8704 focused generation run at the upstream context shape
+- `rtx_pro_6000_broad_q4_after_prefill_65536_20260519.csv` - opt-in broad Q8->Q4 after-prefill sweep; useful candidate data, not a default policy
+- `rtx_pro_6000_topk10240_broad_q4_after_prefill_65536_20260519.csv` - opt-in broad Q8->Q4 after-prefill sweep with experimental CUB top-k extension through `n_comp <= 10240`
+- `rtx_pro_6000_topk12288_boundary_20260519.csv` - focused boundary probe with experimental CUB top-k extensions through `n_comp <= 12288`
+- `rtx_pro_6000_topk12288_broad_q4_after_prefill_65536_20260519.csv` - full opt-in broad Q8->Q4 after-prefill sweep with experimental CUB top-k extensions through `n_comp <= 12288`
+- `rtx_pro_6000_topk_staircase_ab_20260519.csv` - focused A/B comparing exact CUB top-k ceilings `8704`, `10240`, and `12288`
 
 ## Current baseline
 
@@ -247,7 +252,24 @@ DS4_CUDA_Q4_Q8_FILTER=.attn_output_a.weight,.attn_output_b.weight
 DS4_CUDA_Q4_Q8_AFTER_PREFILL=1
 ```
 
-This is the first Q8-derived Q4 result that keeps most of the prefill speed. The startup-preload version reached similar generation speed but cut prefill to `473.53` t/s at `ctx=4096`. The after-prefill version lets prefill use the q8->f16 cache first, releases that optional cache, then builds the Q8-derived Q4 decode cache for the selected attention-output tensors.
+This was the first Q8-derived Q4 result that kept most of the prefill speed. The startup-preload version reached similar generation speed but cut prefill to `473.53` t/s at `ctx=4096`. The after-prefill version lets prefill use the q8->f16 cache first, releases that optional cache, then builds the Q8-derived Q4 decode cache for the selected attention-output tensors.
+
+May 19 update after inspecting Shoji's newer `perf/clean` branch: the broader after-prefill policy is better than the narrow attention-output-only policy. It removes the `DS4_CUDA_Q8_NO_Q4_SINGLE=1` and `DS4_CUDA_Q4_Q8_FILTER=...attn_output...` restrictions, so all eligible Q8 decode tensors can use Q4 after prefill has completed:
+
+```bash
+DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=128
+DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE=1
+DS4_CUDA_Q4_DECODE=1
+DS4_CUDA_Q4_F16_CACHE_ONLY=1
+DS4_CUDA_Q4_F16_FILTER=hc_
+DS4_CUDA_Q4_Q8_DECODE=1
+DS4_CUDA_Q4_Q8_CACHE_ONLY=1
+DS4_CUDA_Q4_Q8_AFTER_PREFILL=1
+```
+
+This broad after-prefill preset is now the best opt-in Q4 performance candidate: `ctx=4096` reached `552.65` prefill / `52.79` gen, and `ctx=32768` reached `504.67` prefill / `49.06` gen while preserving the current known `logprob-vectors` 7-failure shape. It is not a default yet because server/multi-session behavior still needs stress testing.
+
+Full sweep artifact: `speed-bench/rtx_pro_6000_broad_q4_after_prefill_65536_20260519.csv`, from run `~/ds4/codex-runs/20260519-164129-broad-q4-after-prefill-full-sweep`. The sweep stays in the `48.89-53.68` gen t/s band through `ctx=32768`, then steps down at `ctx=34816` (`44.87` gen t/s) and ends at `ctx=65536` (`42.19` gen t/s). Treat the 32k boundary as a new investigation target for cache/dispatch policy.
 
 `ctx=4096`, `gen_tokens=1024`, three repeats:
 
@@ -750,8 +772,21 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Correctness split: the faster F16 `hc_` + Q8 after-prefill preset adds a `short_code_completion` logprob-vector mismatch. Q8 after-prefill only, with `DS4_CUDA_F16_NO_Q4=1`, preserves the known logprob failure shape but only reaches `44.32` gen t/s at `ctx=32768`.
    - Q4 pair is still effectively neutral in the external component benchmark and has not been ported locally.
    - Keep everything behind `DS4_CUDA_Q4_DECODE=1` and add narrower disable switches so quality/performance can be bisected by tensor family.
-   - Current experimental adoption candidate is now F16 `hc_` plus after-prefill Q8 `attn_output_a,b`. Keep it opt-in until server concurrency and many-session cache behavior are stress-tested.
-   - Post-Q4 profiling says this Q4 phase is probably mature enough for now. Next speed work should return to CUDA Graph replay/static-buffer launch reduction, indexed attention/indexer, or MoE gate/up rather than more Q4 cache breadth.
+   - Current experimental adoption candidate is now F16 `hc_` plus broad after-prefill Q8-derived Q4. Keep it opt-in until server concurrency and many-session cache behavior are stress-tested.
+   - May 19 Shoji `perf/clean` triage: `ngc-shj/ds4` showed that broad `DS4_CUDA_Q4_DECODE=1` policy is the source of the short-context decode jump, but startup-broad Q4 still trades away too much prefill. Direct Shoji branch run `~/ds4/codex-runs/20260519-162406-shoji-perf-clean-triage` produced `ctx=4096` `367.42` prefill / `55.52` gen and `ctx=32768` `350.32` prefill / `47.45` gen. It is a design reference, not a drop-in branch.
+   - May 19 local policy scan on clean `codex/q4-f16-decode`, run `~/ds4/codex-runs/20260519-163305-current-q4-policy-scan`: fast preset was `560.48` / `50.65` at `ctx=4096`; broad Q8->Q4 startup was `360.82` / `55.90`; broad Q8->Q4 after-prefill was `552.65` / `52.79`; attention-output-only after-prefill with generic single allowed was `553.24` / `50.55`.
+   - Broad Q8->Q4 after-prefill also holds at the upstream target shape: run `~/ds4/codex-runs/20260519-163656-broad-q4-after-prefill-32768` produced `ctx=32768` `504.67` prefill / `49.06` gen, versus the same-branch fast-preset control `502.14` / `46.90` from `~/ds4/codex-runs/20260519-162748-current-vs-shoji-env`.
+   - Full sweep artifact `speed-bench/rtx_pro_6000_broad_q4_after_prefill_65536_20260519.csv`, run `~/ds4/codex-runs/20260519-164129-broad-q4-after-prefill-full-sweep`: generation stays near `49-54` t/s through `ctx=32768`, then drops to about `44` t/s starting at `ctx=34816`.
+   - Boundary diagnosis, run `~/ds4/codex-runs/20260519-174650-broad-q4-boundary-diagnostics`: the drop is not primarily a Q4 or VRAM boundary. It lines up with `compressed_kv_rows` crossing the current CUB top-k fast-path ceiling of `8704` rows. Observed rows were `ctx=33792`, `compressed_kv_rows=8514`, `48.40` gen t/s, then `ctx=34816`, `compressed_kv_rows=8770`, `45.14` gen t/s.
+   - Experimental top-k extension, run `~/ds4/codex-runs/20260519-175547-topk10240-boundary-ab`: extending the exact CUB top-k path through `n_comp <= 10240` recovered the cliff. With broad Q4 after-prefill, patched results were `ctx=34816` `494.36` prefill / `48.10` gen, `ctx=36864` `489.01` / `48.13`, and `ctx=38912` `487.67` / `47.50`.
+   - Full top-k extension sweep artifact `speed-bench/rtx_pro_6000_topk10240_broad_q4_after_prefill_65536_20260519.csv`, run `~/ds4/codex-runs/20260519-181106-topk10240-full-sweep`: the old `ctx=34816` cliff is gone. Generation is `48.89` at `ctx=32768`, `47.83` at `34816`, `47.36` at `36864`, and `47.06` at `38912`, then falls to `44.42` at `40960`. This confirms the cliff moved to the next uncovered top-k range rather than disappearing.
+   - Correctness sanity for the top-k extension, run `~/ds4/codex-runs/20260519-180521-topk10240-correctness-modelpath`, preserved the current default `make test` shape: `long-context`, `tool-call-quality`, `metal-kernels`, and `server` pass; `logprob-vectors / long_memory_archive` reports the same 7 known failures. Treat this as a candidate patch pending code cleanup and a decision on whether to extend beyond `10240`.
+   - Follow-up top-k `11264`/`12288` extension, run `~/ds4/codex-runs/20260519-182738-topk12288-boundary-verify`, keeps the same correctness shape and moves the next boundary again. Focused results: `ctx=40960` `461.55` prefill / `47.23` gen, `ctx=43008` `460.59` / `47.10`, `ctx=45056` `459.57` / `45.82`, `ctx=47104` `457.98` / `45.68`, then `ctx=49152` drops to `44.09`. This is a clear stair-step: larger exact CUB top-k ranges recover the next context band until the next row-count ceiling.
+   - Full `12288` sweep artifact `speed-bench/rtx_pro_6000_topk12288_broad_q4_after_prefill_65536_20260519.csv`, run `~/ds4/codex-runs/20260519-183413-topk12288-full-sweep`: `ctx=32768` `455.11` prefill / `48.86` gen, `ctx=40960` `449.62` / `47.01`, `ctx=43008` `448.42` / `46.89`, `ctx=45056` `447.23` / `45.59`, `ctx=49152` `442.73` / `43.88`, and `ctx=65536` `432.22` / `42.17`.
+   - Focused A/B artifact `speed-bench/rtx_pro_6000_topk_staircase_ab_20260519.csv`, run `~/ds4/codex-runs/20260519-192402-topk-staircase-ab`, used `gen_tokens=256` to reduce noise. At `ctx=34816`, `topk8704` was `45.36` gen t/s, `topk10240` was `48.26`, and `topk12288` was `48.28`. At `ctx=40960`, `topk8704` was `44.90`, `topk10240` was `44.86`, and `topk12288` was `47.56`. At `ctx=43008`, `topk8704` was `44.79`, `topk10240` was `44.72`, and `topk12288` was `47.43`. At `ctx=49152`, all three are effectively tied around `44.3` gen t/s.
+   - Interpretation: `10240` is clearly worth it for `34816..38912`; `12288` is clearly worth it for `40960..43008` and partially useful for `45056..47104`; neither helps after the next row-count ceiling around `49152`. Carrying the staircase through `12288` is defensible. Extending further should require a fresh A/B because the wider exact sort can start to cost more than it saves.
+   - Correctness sanity for broad after-prefill Q8->Q4, run `~/ds4/codex-runs/20260519-163855-broad-q4-logprob-gate`, preserved the current known `logprob-vectors / long_memory_archive` 7-failure shape. This makes broad after-prefill Q8->Q4 a valid opt-in performance preset candidate, not a default.
+   - Post-Q4 profiling still says not to expand Q4 blindly. The next Q4-specific work should be focused: server/multi-session stress, a clean preset wrapper, and exactness analysis for the remaining logprob-vector drift. Bigger speed work should return to CUDA Graph replay/static-buffer launch reduction, indexed attention/indexer, or MoE gate/up.
 
 2. **Logprob-vector parity probe**
    - The Alice long-context failure is resolved on the post-`c9dd949` sync, but `make test CUDA_ARCH=sm_120` still fails `logprob-vectors / long_memory_archive` under the default reserve.
@@ -790,7 +825,8 @@ Goal for the next phase: improve RTX Pro 6000 generation speed at the upstream b
    - Built-in fallback toggles and existing grouped-head single-token routing did not help. The May 18 grouped-head probes were all slower, with the best grouped variant at `40.82` vs `42.67` gen t/s.
    - Decode-only sorting of the selected top-k rows was also slightly slower (`42.57` vs `42.69` gen t/s), so do not chase local row-order cleanup as a standalone patch.
    - Post-`c9dd949`, the narrow CUB top-k fast path for `8192 < n_comp <= 8704` is adopted after preserving the current `make test` failure shape.
-   - Next useful work here is either a correctness-preserving harness for larger `n_comp` top-k ranges or a purpose-built one-token indexed-attention kernel. Do not reuse the existing grouped prefill/batch kernel as-is; the A/B says it gives up too much parallelism.
+   - May 19 boundary work found the next concrete top-k cliff: `compressed_kv_rows` crosses `8704` between `ctx=33792` and `ctx=34816`, switching from exact CUB top-k to the chunked tree path. A templated CUB extension through `n_comp <= 10240` recovered generation from about `45.1` to `48.1` t/s at `ctx=34816` and stayed near `47-48` t/s through `ctx=38912`, while preserving the known `make test` failure shape. Extending to `11264`/`12288` recovered `ctx=40960` and `43008` to about `47.2` t/s, then exposed the next ceiling around `49152`.
+   - Next useful work here is to decide whether this exact-CUB staircase should be adopted as a bounded local patch, and if so how far to extend it before shared-memory/register cost becomes counterproductive. A purpose-built one-token indexed-attention kernel is still the larger design target. Do not reuse the existing grouped prefill/batch kernel as-is; the A/B says it gives up too much parallelism.
 
 7. **MoE decode kernel inspection**
    - MoE decode LUT and related routed/shared kernels remain large GPU-time buckets.
