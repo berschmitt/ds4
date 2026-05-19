@@ -482,6 +482,11 @@ Operational note: future fallback-disabling probes should use shorter generation
   - `DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6=1`: `42.98` gen t/s. Direct down-sum6 is roughly neutral in this short screen, not an obvious missing win.
   - Decode-only MoE profile from the same run, split to `tokens=1`: 2752 routed-MoE calls averaged `0.004 ms` xq, `0.057 ms` gate/up, `0.004 ms` mid quant, `0.020 ms` down, `0.086 ms` total per layer call. Across 43 layers this is about `3.7 ms/token`, with gate/up the larger MoE bucket.
   - Conclusion: current MoE decode fast paths are carrying throughput. Future MoE work should target a concrete new gate/up or direct-down kernel idea, not fallback toggles.
+- Shared gate/up SwiGLU fusion probe, run `~/ds4/codex-runs/20260519-044338-shared-swiglu-ab`: rejected as noise-level gain with extra kernel/API surface.
+  - Prototype fused shared expert gate/up q8_0 pair matvec plus SwiGLU into one kernel. The fastest test path skipped auxiliary `gate`/`up` writes, so a real patch would have needed a semantic-preserving retest anyway.
+  - At `ctx=32768`, 512 generated tokens, fused gen t/s was `47.39`, `47.35`, `47.32`; disabled gen t/s was `47.29`, `47.27`, `47.29`.
+  - At `ctx=4096`, fused was `50.94` gen t/s and disabled was `50.76` gen t/s.
+  - Conclusion: even the aggressive no-aux prototype only moved decode by about `0.1-0.2` t/s. Do not carry. MoE shared gate/up is not closed forever, but the next attempt needs a materially different kernel idea, not this local fusion shape.
 - Forced ordered one-token f16 matmul on post-topk8704 `main`, run `~/ds4/codex-runs/20260518-002007-f16-ordered-policy-ab`: confirms the Blackwell default should stay generic.
   - Base: average `42.64` gen t/s over 3 runs.
   - `DS4_CUDA_USE_ORDERED_F16_MATMUL=1`: average `40.78` gen t/s over 3 runs.
